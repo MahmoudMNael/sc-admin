@@ -32,12 +32,15 @@ async def test_create_returns_201(client: AsyncClient):
     response = await client.post("/api/v1/standards/", json=sample_json())
     assert response.status_code == 201
     body = response.json()
-    assert body["id"] == "en12464_1_v2019_6_1_1"
-    assert body["qdrant_point_id"] == point_id_for(sample_payload())
-    assert "content_hash" in body
-    assert body["content_hash"]
-    assert "created_at" in body
-    assert "updated_at" in body
+    assert body["success"] is True
+    assert body["pagination"] is None
+    data = body["data"]
+    assert data["id"] == "en12464_1_v2019_6_1_1"
+    assert data["qdrant_point_id"] == point_id_for(sample_payload())
+    assert "content_hash" in data
+    assert data["content_hash"]
+    assert "created_at" in data
+    assert "updated_at" in data
 
 
 async def test_create_unknown_field_422(client: AsyncClient):
@@ -63,7 +66,11 @@ async def test_bulk_returns_202_without_blocking(client: AsyncClient):
     }
     response = await client.post("/api/v1/standards/bulk", json=payload)
     assert response.status_code == 202
-    assert response.json() == {"status": "accepted", "item_count": 2}
+    assert response.json() == {
+        "success": True,
+        "data": {"status": "accepted", "item_count": 2},
+        "pagination": None,
+    }
 
 
 async def test_bulk_duplicate_ids_400(client: AsyncClient):
@@ -107,6 +114,48 @@ async def test_patch_rejects_content_hash(client: AsyncClient):
         json={"content_hash": "abc"},
     )
     assert response.status_code == 422
+
+
+async def test_list_paginates(client: AsyncClient):
+    await client.post("/api/v1/standards/", json=sample_json())
+    await client.post(
+        "/api/v1/standards/",
+        json=sample_json(id="second", hierarchy=sample_hierarchy(ref_number="6.1.2")),
+    )
+    await client.post(
+        "/api/v1/standards/",
+        json=sample_json(id="third", hierarchy=sample_hierarchy(ref_number="6.1.3")),
+    )
+    response = await client.get("/api/v1/standards/", params={"page": 1, "limit": 2})
+    assert response.status_code == 200
+    body = response.json()
+    assert body["success"] is True
+    assert len(body["data"]) == 2
+    assert body["pagination"] == {
+        "total_count": 3,
+        "page_size": 2,
+        "current_page": 1,
+        "total_pages": 2,
+    }
+    page2 = await client.get("/api/v1/standards/", params={"page": 2, "limit": 2})
+    assert page2.status_code == 200
+    assert len(page2.json()["data"]) == 1
+    assert page2.json()["pagination"]["current_page"] == 2
+
+
+async def test_list_rejects_page_zero(client: AsyncClient):
+    response = await client.get("/api/v1/standards/", params={"page": 0})
+    assert response.status_code == 422
+
+
+async def test_get_one_wraps_without_pagination(client: AsyncClient):
+    await client.post("/api/v1/standards/", json=sample_json())
+    response = await client.get("/api/v1/standards/en12464_1_v2019_6_1_1")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["success"] is True
+    assert body["pagination"] is None
+    assert body["data"]["id"] == "en12464_1_v2019_6_1_1"
 
 
 async def test_get_missing_404(client: AsyncClient):

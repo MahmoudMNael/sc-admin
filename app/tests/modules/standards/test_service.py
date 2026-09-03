@@ -156,3 +156,17 @@ async def test_empty_patch_400():
     with pytest.raises(HTTPException) as exc:
         await service.update_standard(created.id, UpdateStandardRequest())
     assert exc.value.status_code == 400
+
+
+async def test_list_returns_items_and_total():
+    service, repo = _service()
+    await service.create_standard(sample_payload())
+    await service.create_standard(
+        sample_payload(id="second", hierarchy=sample_hierarchy(ref_number="6.1.2"))
+    )
+    items, total = await service.list_standards(
+        None, None, None, None, None, [], "any", skip=0, limit=1
+    )
+    assert total == 2
+    assert len(items) == 1
+    assert len(repo.store) == 2

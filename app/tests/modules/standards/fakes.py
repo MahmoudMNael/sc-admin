@@ -36,6 +36,10 @@ class FakeStandardRepository(AbstractRepository[Standard, str]):
         items = list(self.store.values())
         return items[skip : skip + limit]
 
+    async def count(self, spec: Specification) -> int:
+        # ponytail: fake ignores spec the same way find does; swap both for in-memory spec eval if list tests need filter totals.
+        return len(self.store)
+
     async def update(self, id: str, data: dict) -> Optional[Standard]:
         entity = self.store.get(id)
         if entity is None:

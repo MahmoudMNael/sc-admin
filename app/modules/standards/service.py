@@ -147,7 +147,30 @@ class StandardService:
         match_mode: Literal["any", "all"],
         skip: int,
         limit: int,
-    ) -> list[StandardResponse]:
+    ) -> tuple[list[StandardResponse], int]:
+        spec = self._list_spec(
+            standard_code,
+            version_year,
+            is_latest,
+            category_table_number,
+            activity,
+            keywords,
+            match_mode,
+        )
+        total = await self.repository.count(spec)
+        standards = await self.repository.find(spec, skip=skip, limit=limit)
+        return [StandardResponse.model_validate(s) for s in standards], total
+
+    def _list_spec(
+        self,
+        standard_code: str | None,
+        version_year: str | None,
+        is_latest: bool | None,
+        category_table_number: str | None,
+        activity: str | None,
+        keywords: list[str],
+        match_mode: Literal["any", "all"],
+    ) -> Specification:
         filters: list[Specification] = []
         if standard_code:
             filters.append(FieldEquals("standard_metadata.standard_code", standard_code))
@@ -165,9 +188,7 @@ class StandardService:
         spec: Specification = MatchAllSpecification()
         for f in filters:
             spec = spec & f
-
-        standards = await self.repository.find(spec, skip=skip, limit=limit)
-        return [StandardResponse.model_validate(s) for s in standards]
+        return spec
 
     async def update_standard(self, standard_id: str, payload: UpdateStandardRequest) -> StandardResponse:
         existing = await self.repository.get_by_id(standard_id)

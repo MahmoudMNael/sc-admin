@@ -28,6 +28,9 @@ class AbstractRepository(ABC, Generic[EntityT, IdT]):
         """Return entities matching an arbitrary Specification. See Section 6."""
 
     @abstractmethod
+    async def count(self, spec: Specification) -> int: ...
+
+    @abstractmethod
     async def update(self, id: IdT, data: dict) -> Optional[EntityT]: ...
 
     @abstractmethod

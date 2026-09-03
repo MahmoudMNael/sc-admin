@@ -1,6 +1,6 @@
 from typing import Generic, Optional, Sequence, Type, TypeVar
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.shared.repository.base import AbstractRepository
@@ -47,6 +47,10 @@ class SQLRepository(AbstractRepository[ModelT, int], Generic[ModelT]):
         stmt = select(self.model).where(spec.to_sql(self.model)).offset(skip).limit(limit)
         result = await self.session.execute(stmt)
         return result.scalars().all()
+
+    async def count(self, spec: Specification) -> int:
+        stmt = select(func.count()).select_from(self.model).where(spec.to_sql(self.model))
+        return await self.session.scalar(stmt) or 0
 
     async def update(self, id: int, data: dict) -> Optional[ModelT]:
         entity = await self.get_by_id(id)

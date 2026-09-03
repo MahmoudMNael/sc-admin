@@ -1,6 +1,6 @@
 # FastAPI Modular CRUD Architecture — Repository Pattern (Dual ORM + Local File Storage)
 
-**Standards is the first implemented module.** Every future module (Postgres or Mongo, with or without file storage) should mirror its shape exactly — see Section 16 for the checklist.
+**Standards is the first implemented module.** Every future module (Postgres or Mongo, with or without file storage) should mirror its shape exactly — see Section 11 for the checklist.
 
 ## 1. Goals & Constraints
 
@@ -8,6 +8,7 @@
 - **Two ORMs, one pattern**: SQLAlchemy 2.x (async) for Postgres, Beanie (async, built on Motor + Pydantic) for MongoDB. Both are hidden behind the same repository abstraction so services never import `sqlalchemy` or `beanie` directly.
 - **File uploads are a repository too**: local filesystem storage is abstracted the same way DB access is, so it can be swapped for S3/GCS later without touching services. (No module needs this yet — the abstraction is ready for when one does.)
 - **Feature-based modules**: every domain concept lives in its own folder with `controller.py`, `service.py`, `repository.py`, `models.py` (ORM/ODM entities), `dto.py` (Pydantic schemas), `dependencies.py` (DI wiring).
+- **Consistent JSON envelope**: successes are `{success: true, data, pagination}` (`ApiResponse[T]`). Collection GET fills pagination from `page`/`limit` query params; other JSON routes set `pagination` to `null`. Errors stay `{detail: ...}`; DELETE stays 204.
 - **Strict validation everywhere**: every request/response body is a distinct Pydantic model with `extra="forbid"`, explicit `Field` constraints, and shows up correctly in Swagger via `response_model`.
 - **DI**: native FastAPI `Depends` + `Annotated` aliases — no extra DI framework needed for a CRUD app.
 - **Idempotent writes**: modules built around externally-sourced, deterministic data (like Standards) treat `create` as safe to retry; bulk create is accepted asynchronously — see Section 10.
@@ -31,7 +32,7 @@ asyncpg
 alembic
 
 # MongoDB
-beanie                  # includes motor & pydantic integration
+beanie>=1.26,<2         # Beanie 2 dropped Motor; pin below 2
 motor
 
 # File uploads — infra ready, no module uses it yet
@@ -48,7 +49,7 @@ mypy
 
 ```bash
 pip install fastapi "uvicorn[standard]" pydantic pydantic-settings \
-  sqlalchemy asyncpg alembic beanie motor \
+  sqlalchemy asyncpg alembic "beanie>=1.26,<2" motor \
   python-multipart aiofiles \
   pytest pytest-asyncio httpx ruff mypy
 ```
@@ -76,7 +77,8 @@ app/
 ├── shared/
 │   ├── dto/
 │   │   ├── error.py                # ErrorResponse schema
-│   │   └── pagination.py           # generic Page[T] wrapper (not used yet — see Roadmap)
+│   │   ├── pagination.py           # PaginationQuery (page, limit) + PaginationMeta
+│   │   └── response.py             # ApiResponse[T] — {success, data, pagination}
 │   ├── specification/
 │   │   ├── base.py                 # Specification[Model] — ORM-agnostic composable criteria
 │   │   ├── fields.py               # FieldEquals
@@ -97,7 +99,11 @@ app/
 │       ├── dto.py
 │       └── dependencies.py
 └── tests/                       # in-memory only — never a real DB or filesystem (Section 15)
-    ├── conftest.py
+    ├── conftest.py              # dummy Beanie document settings; no init_mongo
+    ├── shared/
+    │   ├── test_pagination.py
+    │   ├── test_qdrant.py
+    │   └── test_specification.py
     └── modules/
         └── standards/...
 ```
@@ -154,6 +160,9 @@ class AbstractRepository(ABC, Generic[EntityT, IdT]):
         """Return entities matching an arbitrary Specification. See Section 6."""
 
     @abstractmethod
+    async def count(self, spec: Specification) -> int: ...
+
+    @abstractmethod
     async def update(self, id: IdT, data: dict) -> Optional[EntityT]: ...
 
     @abstractmethod
@@ -167,7 +176,7 @@ Assumes every SQLAlchemy model exposes its primary key as `.id` (as `Product`, `
 ```python
 # shared/repository/sql_repository.py
 from typing import Generic, TypeVar, Type, Optional, Sequence
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.shared.repository.base import AbstractRepository
 from app.shared.specification.base import Specification
@@ -212,6 +221,10 @@ class SQLRepository(AbstractRepository[ModelT, int], Generic[ModelT]):
         stmt = select(self.model).where(spec.to_sql(self.model)).offset(skip).limit(limit)
         result = await self.session.execute(stmt)
         return result.scalars().all()
+
+    async def count(self, spec: Specification) -> int:
+        stmt = select(func.count()).select_from(self.model).where(spec.to_sql(self.model))
+        return await self.session.scalar(stmt) or 0
 
     async def update(self, id: int, data: dict) -> Optional[ModelT]:
         entity = await self.get_by_id(id)
@@ -272,6 +285,10 @@ class MongoRepository(AbstractRepository[DocT, IdT], Generic[DocT, IdT]):
     async def find(self, spec: Specification, skip: int = 0, limit: int = 100) -> Sequence[DocT]:
         query = spec.to_mongo(self.model)
         return await self.model.find(query).skip(skip).limit(limit).to_list()
+
+    async def count(self, spec: Specification) -> int:
+        query = spec.to_mongo(self.model)
+        return await self.model.find(query).count()
 
     async def update(self, id: IdT, data: dict) -> Optional[DocT]:
         entity = await self.get_by_id(id)
@@ -507,8 +524,50 @@ See `StandardService.list_standards` in Section 9 for `FieldEquals` and `Keyword
 - Responses: `model_config = ConfigDict(from_attributes=True)` so they build straight from the entity via `Model.model_validate(entity)`.
 - Every field gets an explicit `Field(...)` constraint where one makes sense (`min_length`, `ge`/`le`, etc.) rather than a bare type.
 - Always set `response_model=...` on the route — that's what drives the accurate Swagger schema and strips unintended fields, even if the service accidentally returns extra data.
+- JSON successes wrap in `ApiResponse[T]` (`shared/dto/response.py`): `{success: true, data: T, pagination: PaginationMeta | null}`. `data` is whatever that route used to return. Collection GET fills `pagination`; other JSON routes set it to `null`. `HTTPException` and Pydantic 422 stay `{detail: ...}` — not this envelope. DELETE stays 204 with no body.
+- Collection GET takes `PaginationQuery` (`page` ≥ 1, `limit` 1–1000, defaults 1 / 100) as query params. Inject with `Annotated[PaginationQuery, Depends()]` — `Query()` on the model 422s. Storage still uses `skip`/`limit`; `PaginationQuery.skip` is `(page - 1) * limit`. `page_size` in the meta is the request `limit`. List services return `(items, total_count)` so the controller can build `PaginationMeta.from_query`.
 - Bulk operations get their own request/response DTOs (a wrapper `items: list[Create{X}Request]`). Long-running bulk creates may return `202 Accepted` immediately and run inserts in a FastAPI `BackgroundTasks` job — see `CreateManyStandardsRequest` / `CreateManyStandardsAcceptedResponse` in Section 9.
 - Derived fields (e.g. `content_hash`, `qdrant_point_id`, timestamps) live on the entity/response, not on create/update requests. The service computes them before persist. Identity fields that must not change later (`standard_code`, `version_year`, `category_table_number`, `ref_number`, and `qdrant_point_id`) are omitted from `Update{X}Request` so `extra="forbid"` 422s any attempt to PATCH them.
+
+```python
+# shared/dto/pagination.py
+from math import ceil
+from pydantic import BaseModel, Field
+
+class PaginationQuery(BaseModel):
+    page: int = Field(1, ge=1)
+    limit: int = Field(100, ge=1, le=1000)
+
+    @property
+    def skip(self) -> int:
+        return (self.page - 1) * self.limit
+
+
+class PaginationMeta(BaseModel):
+    total_count: int = Field(..., ge=0)
+    page_size: int = Field(..., ge=1)
+    current_page: int = Field(..., ge=1)
+    total_pages: int = Field(..., ge=0)
+
+    @classmethod
+    def from_query(cls, total_count: int, page: int, limit: int) -> "PaginationMeta":
+        total_pages = ceil(total_count / limit) if total_count else 0
+        return cls(total_count=total_count, page_size=limit, current_page=page, total_pages=total_pages)
+```
+
+```python
+# shared/dto/response.py
+from typing import Generic, Literal, TypeVar
+from pydantic import BaseModel
+from app.shared.dto.pagination import PaginationMeta
+
+T = TypeVar("T")
+
+class ApiResponse(BaseModel, Generic[T]):
+    success: Literal[True] = True
+    data: T
+    pagination: PaginationMeta | None = None
+```
 
 ---
 
@@ -896,7 +955,25 @@ class StandardService:
         match_mode: Literal["any", "all"],
         skip: int,
         limit: int,
-    ) -> list[StandardResponse]:
+    ) -> tuple[list[StandardResponse], int]:
+        spec = self._list_spec(
+            standard_code, version_year, is_latest, category_table_number,
+            activity, keywords, match_mode,
+        )
+        total = await self.repository.count(spec)
+        standards = await self.repository.find(spec, skip=skip, limit=limit)
+        return [StandardResponse.model_validate(s) for s in standards], total
+
+    def _list_spec(
+        self,
+        standard_code: str | None,
+        version_year: str | None,
+        is_latest: bool | None,
+        category_table_number: str | None,
+        activity: str | None,
+        keywords: list[str],
+        match_mode: Literal["any", "all"],
+    ) -> Specification:
         filters: list[Specification] = []
         if standard_code:
             filters.append(FieldEquals("standard_metadata.standard_code", standard_code))
@@ -914,9 +991,7 @@ class StandardService:
         spec: Specification = MatchAllSpecification()
         for f in filters:
             spec = spec & f
-
-        standards = await self.repository.find(spec, skip=skip, limit=limit)
-        return [StandardResponse.model_validate(s) for s in standards]
+        return spec
 
     async def update_standard(self, standard_id: str, payload: UpdateStandardRequest) -> StandardResponse:
         existing = await self.repository.get_by_id(standard_id)
@@ -948,9 +1023,12 @@ class StandardService:
 
 ```python
 # modules/standards/controller.py
-from typing import Literal
-from fastapi import APIRouter, BackgroundTasks, Query, status
+from typing import Annotated, Literal
+from fastapi import APIRouter, BackgroundTasks, Depends, Query, status
 
+from app.shared.dto.error import ErrorResponse
+from app.shared.dto.pagination import PaginationMeta, PaginationQuery
+from app.shared.dto.response import ApiResponse
 from .dependencies import StandardServiceDep
 from .dto import (
     CreateManyStandardsAcceptedResponse, CreateManyStandardsRequest,
@@ -959,13 +1037,17 @@ from .dto import (
 
 router = APIRouter(prefix="/standards", tags=["Standards"])
 
+RESP_400 = {status.HTTP_400_BAD_REQUEST: {"model": ErrorResponse}}
+RESP_404 = {status.HTTP_404_NOT_FOUND: {"model": ErrorResponse}}
+RESP_409 = {status.HTTP_409_CONFLICT: {"model": ErrorResponse}}
 
-@router.post("/", response_model=StandardResponse, status_code=status.HTTP_201_CREATED)
+
+@router.post("/", response_model=ApiResponse[StandardResponse], status_code=status.HTTP_201_CREATED, responses={**RESP_409})
 async def create_standard(payload: CreateStandardRequest, service: StandardServiceDep):
-    return await service.create_standard(payload)
+    return ApiResponse(data=await service.create_standard(payload))
 
 
-@router.post("/bulk", response_model=CreateManyStandardsAcceptedResponse, status_code=status.HTTP_202_ACCEPTED)
+@router.post("/bulk", response_model=ApiResponse[CreateManyStandardsAcceptedResponse], status_code=status.HTTP_202_ACCEPTED, responses={**RESP_400})
 async def create_many_standards(
     payload: CreateManyStandardsRequest,
     service: StandardServiceDep,
@@ -973,12 +1055,13 @@ async def create_many_standards(
 ):
     service.reject_duplicate_keys(payload)
     background_tasks.add_task(service.create_many_standards, payload)
-    return CreateManyStandardsAcceptedResponse(item_count=len(payload.items))
+    return ApiResponse(data=CreateManyStandardsAcceptedResponse(item_count=len(payload.items)))
 
 
-@router.get("/", response_model=list[StandardResponse])
+@router.get("/", response_model=ApiResponse[list[StandardResponse]])
 async def list_standards(
     service: StandardServiceDep,
+    pagination: Annotated[PaginationQuery, Depends()],
     standard_code: str | None = Query(default=None),
     version_year: str | None = Query(default=None),
     is_latest: bool | None = Query(default=None),
@@ -986,28 +1069,30 @@ async def list_standards(
     activity: str | None = Query(default=None),
     keywords: list[str] = Query(default=[]),
     match_mode: Literal["any", "all"] = Query(default="any"),
-    skip: int = 0,
-    limit: int = 100,
 ):
-    return await service.list_standards(
+    items, total = await service.list_standards(
         standard_code, version_year, is_latest, category_table_number,
-        activity, keywords, match_mode, skip, limit,
+        activity, keywords, match_mode, pagination.skip, pagination.limit,
+    )
+    return ApiResponse(
+        data=items,
+        pagination=PaginationMeta.from_query(total, pagination.page, pagination.limit),
     )
 
 
 # NOTE: static paths ("/bulk" above) must be declared before "/{standard_id}" —
 # otherwise FastAPI matches them as the path parameter instead.
-@router.get("/{standard_id}", response_model=StandardResponse)
+@router.get("/{standard_id}", response_model=ApiResponse[StandardResponse], responses={**RESP_404})
 async def get_standard(standard_id: str, service: StandardServiceDep):
-    return await service.get_standard(standard_id)
+    return ApiResponse(data=await service.get_standard(standard_id))
 
 
-@router.patch("/{standard_id}", response_model=StandardResponse)
+@router.patch("/{standard_id}", response_model=ApiResponse[StandardResponse], responses={**RESP_400, **RESP_404})
 async def update_standard(standard_id: str, payload: UpdateStandardRequest, service: StandardServiceDep):
-    return await service.update_standard(standard_id, payload)
+    return ApiResponse(data=await service.update_standard(standard_id, payload))
 
 
-@router.delete("/{standard_id}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete("/{standard_id}", status_code=status.HTTP_204_NO_CONTENT, responses={**RESP_404})
 async def delete_standard(standard_id: str, service: StandardServiceDep):
     await service.delete_standard(standard_id)
 ```
@@ -1051,7 +1136,7 @@ The `id` field (e.g. `"en12464_1_v2019_6_1_1"`) is a **deterministic natural key
 | New `id`, computed `qdrant_point_id` already used by another document | **`409 Conflict`.** Unique index is the race backstop (`DuplicateKeyError` → 409). |
 | Duplicate `id`s **or** duplicate computed `qdrant_point_id`s (same identity fields) inside one `create_many` payload | **`400 Bad Request`.** Client-side bug, rejected before the background job is queued. |
 
-`POST /standards/bulk` validates the batch (schema + `reject_duplicate_keys`) then returns **`202 Accepted`** with `{status: "accepted", item_count: N}` and runs `create_many_standards` in a FastAPI `BackgroundTasks` job. The worker applies the same per-item insert/skip rules but **does not** report outcomes back — the HTTP response has already been sent.
+`POST /standards/bulk` validates the batch (schema + `reject_duplicate_keys`) then returns **`202 Accepted`** with `ApiResponse` wrapping `{status: "accepted", item_count: N}` (`pagination` is `null`) and runs `create_many_standards` in a FastAPI `BackgroundTasks` job. The worker applies the same per-item insert/skip rules but **does not** report outcomes back — the HTTP response has already been sent.
 
 > Ceiling: `BackgroundTasks` are in-process; a crash loses the job and there is no status endpoint. Upgrade to a real queue (or a job document) if bulk ingest must be durable.
 
@@ -1064,9 +1149,9 @@ This pattern (natural key as the DB id + a computed content fingerprint + a UUID
 1. Create `modules/<name>/` with the six files: `models.py`, `dto.py`, `repository.py`, `service.py`, `controller.py`, `dependencies.py`.
 2. **`models.py`**: define the entity — a Beanie `Document` (Mongo) or a `Mapped[...]` SQLAlchemy class (Postgres). Decide the ID strategy up front (auto-generated vs. natural key) — it determines whether you need Standards-style idempotency logic.
 3. **`dto.py`**: `Create{X}Request`, `Update{X}Request` (all optional), `{X}Response`, plus bulk variants if needed. `extra="forbid"` + explicit `Field` constraints on everything. Derived fields (`content_hash`, `qdrant_point_id`, timestamps) and immutable identity fields stay off the request models they don't belong on.
-4. **`repository.py`**: subclass `SQLRepository[Model]` or `MongoRepository[Model, IdType]`, set `model = ...`, add custom queries only if `find(spec)` genuinely can't express them.
-5. **`service.py`**: business logic only — DTO↔entity mapping, idempotency/business rules, `HTTPException` for domain errors (404/409/etc). Define a `SEARCHABLE_FIELDS` allowlist here if the module needs keyword search.
-6. **`controller.py`**: thin routes, `response_model` on every one, delegate to the service via its `*ServiceDep` alias. Static paths (`/search`, `/bulk`) before `/{id}` paths.
+4. **`repository.py`**: subclass `SQLRepository[Model]` or `MongoRepository[Model, IdType]`, set `model = ...`, add custom queries only if `find(spec)` / `count(spec)` genuinely can't express them.
+5. **`service.py`**: business logic only — DTO↔entity mapping, idempotency/business rules, `HTTPException` for domain errors (404/409/etc). List methods return `(items, total_count)` from `find` + `count`. Define a `SEARCHABLE_FIELDS` allowlist here if the module needs keyword search.
+6. **`controller.py`**: thin routes, `response_model=ApiResponse[...]` on every JSON success (list: `ApiResponse[list[{X}Response]]`). Wrap returns in `ApiResponse`; collection GET injects `Annotated[PaginationQuery, Depends()]` and sets `pagination=PaginationMeta.from_query(...)`. DELETE stays 204 with no body. Static paths (`/search`, `/bulk`) before `/{id}` paths.
 7. **`dependencies.py`**: `get_<x>_repository` → `get_<x>_service` → `<X>ServiceDep`.
 8. Register the router in `main.py`. If Mongo: add the `Document` class to `init_beanie(document_models=[...])` in `db/mongo/client.py`. If Postgres: generate an Alembic migration.
 9. Add tests mirroring `tests/modules/standards/` — in-memory fakes only (Section 15). Never point tests at a real database or directory.
@@ -1148,47 +1233,32 @@ class ErrorResponse(BaseModel):
     detail: str
 ```
 
-The examples in Section 9 raise `HTTPException` directly, which FastAPI already turns into a `{"detail": "..."}` JSON body — consistent with `ErrorResponse` above. For per-route Swagger documentation of error shapes, add `responses={404: {"model": ErrorResponse}, 409: {"model": ErrorResponse}}` to route decorators as needed.
+The examples in Section 9 raise `HTTPException` directly, which FastAPI already turns into a `{"detail": "..."}` JSON body — consistent with `ErrorResponse` above, and **not** wrapped in `ApiResponse`. For per-route Swagger documentation of error shapes, add `responses={404: {"model": ErrorResponse}, 409: {"model": ErrorResponse}}` to route decorators as needed.
 
 ---
 
 ## 14. Local Dev Infra
 
-```yaml
-# docker-compose.yml
-version: '3.9'
-services:
-  mongo:
-    image: mongo:7
-    ports: ['27017:27017']
-    volumes: ['mongodata:/data/db']
+No Docker in this repo. Run Mongo (and later Postgres) however you already do.
 
-  # postgres:                # uncomment once the first SQL-backed module exists
-  #   image: postgres:16
-  #   environment:
-  #     POSTGRES_USER: app
-  #     POSTGRES_PASSWORD: app
-  #     POSTGRES_DB: app
-  #   ports: ["5432:5432"]
-  #   volumes: ["pgdata:/var/lib/postgresql/data"]
+Copy `.env.example` to `.env` and fill the names yourself. Names only — no sample hosts or passwords in `.env.example`:
 
-volumes:
-  mongodata:
-  # pgdata:
+```
+MONGO_URI=
+MONGO_DB_NAME=
+POSTGRES_DSN=
+LOCAL_STORAGE_PATH=
+APP_NAME=
+ENV=
 ```
 
-```bash
-# .env
-MONGO_URI=mongodb://localhost:27017
-MONGO_DB_NAME=app
-LOCAL_STORAGE_PATH=./uploads
-```
+`MONGO_URI` is required to boot. `POSTGRES_DSN` stays unused until the first SQL module.
 
 ---
 
 ## 15. Testing Strategy
 
-**Hard rule: tests must not persist anything.** No Mongo, no Postgres, no files on disk, no TestClient lifespan that calls `init_mongo`. A fake in-memory repository (a dict behind `AbstractRepository`) is the only store. If a test would need a real database or `./uploads` to pass, the test is wrong.
+**Hard rule: tests must not persist anything.** No Mongo, no Postgres, no files on disk, no TestClient lifespan that calls `init_mongo`. A fake in-memory repository (a dict behind `AbstractRepository`) is the only store. If a test would need a real database or `./uploads` to pass, the test is wrong. Beanie `Document.__init__` still needs collection settings, so `tests/conftest.py` assigns a dummy `Standard._document_settings` — that is not a database connection.
 
 - **Service tests**: inject a `FakeStandardRepository`. Assert the happy path (computed `content_hash` / `qdrant_point_id` / timestamps, idempotent skip) and the error path (`HTTPException` 400/404/409). Nothing is written outside the fake.
   - Create payload has `_id` and **no** `content_hash` or `qdrant_point_id`; the entity the fake received has a computed hash, UUID v5 point id, and timestamps.
@@ -1198,9 +1268,9 @@ LOCAL_STORAGE_PATH=./uploads
   - PATCH of content recomputes the hash and leaves `qdrant_point_id` and identity fields untouched.
   - `reject_duplicate_keys` with a repeated `id` or a repeated computed `qdrant_point_id` in one payload → `400`.
   - `create_many_standards` (the worker) inserts only genuinely new items into the fake; same-id retries and taken point ids are skipped.
-- **Controller tests**: `httpx.AsyncClient` against an app that **does not** run the production lifespan, with `app.dependency_overrides[get_standard_service] = lambda: FakeStandardService()`. Assert status codes and response bodies (flow + errors). Pydantic 422s (unknown fields, `qdrant_point_id` on create, identity fields / `qdrant_point_id` / `content_hash` on PATCH) live here. `POST /bulk` returns **202** with `item_count` without waiting on inserts.
-- **Helper tests**: `generate_qdrant_point_id` is stable for the same identity, differs for `6.1|6.1.3.1` vs `6.13|6.13.1`, and ignores `activity`.
-- **No repository/integration tests against a live engine.** Unique indexes and query plans are not the unit-test suite's job. Docker Compose is for local *running* of the app, not for pytest.
+- **Controller tests**: `httpx.AsyncClient` against an app that **does not** run the production lifespan, with `app.dependency_overrides[get_standard_service] = lambda: FakeStandardService()`. Assert status codes and response bodies (flow + errors). JSON 2xx bodies are `{success, data, pagination}`; collection GET fills `pagination`, other JSON routes have `pagination: null`. `HTTPException` 404/409 stay `{detail: ...}` (not the envelope). Pydantic 422s (unknown fields, `qdrant_point_id` on create, identity fields / `qdrant_point_id` / `content_hash` on PATCH, `page=0`) live here. `POST /bulk` returns **202** with `data.item_count` without waiting on inserts. DELETE is **204** with no body.
+- **Helper tests**: `generate_qdrant_point_id` is stable for the same identity, differs for `6.1|6.1.3.1` vs `6.13|6.13.1`, and ignores `activity`. `PaginationQuery.skip` and `PaginationMeta.from_query` (including `total_pages=0` when `total_count=0`).
+- **No repository/integration tests against a live engine.** Unique indexes and query plans are not the unit-test suite's job. Local Mongo is for running the app, not for pytest.
 
 ---
 
@@ -1221,12 +1291,12 @@ Once implemented, protected routes add `user: Annotated[User, Depends(get_curren
 ## 17. Getting Started Checklist
 
 1. `pip install` the packages from Section 2.
-2. `docker compose up -d` for local Mongo.
+2. Copy `.env.example` to `.env` and fill `MONGO_URI` (and the other names you need). Point it at Mongo you already run.
 3. Scaffold `core/`, `db/`, `storage/`, `shared/` as in Section 3.
 4. Build `modules/standards/` from Section 9's code.
 5. Wire `main.py` + `db/mongo/client.py` (Section 12), confirm Swagger UI at `/docs` shows accurate, strict schemas for every Standards route.
 6. Add error handling (Section 13).
-7. Add tests (Section 15) as you go, not after — in-memory fakes only, never against the compose Mongo or `./uploads`.
+7. Add tests (Section 15) as you go, not after — in-memory fakes only, never against Mongo or `./uploads`.
 8. For each new module going forward, follow Section 11's checklist.
 
 ---
@@ -1235,7 +1305,6 @@ Once implemented, protected routes add `user: Annotated[User, Depends(get_curren
 
 - First Postgres-backed module, using Section 5b's `SQLRepository` the same way Standards uses `MongoRepository`.
 - Auth (JWT or session-based) + `get_current_user` + per-route scopes.
-- Generic `Page[T]` response wrapper for consistent pagination metadata (`total`, `skip`, `limit`) once list endpoints need it.
 - Mongo text index + `$text` search for `Standard.searchable_text` if `$regex` scanning becomes a bottleneck.
 - First file-upload module using `AbstractFileStorage`, swappable to `S3FileStorage` later.
 - Structured logging + request ID middleware.

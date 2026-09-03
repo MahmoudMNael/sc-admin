@@ -47,7 +47,7 @@ class StandardParametersDTO(BaseModel):
 
 
 class CreateStandardRequest(BaseModel):
-    model_config = ConfigDict(extra="ignore", str_strip_whitespace=True, populate_by_name=True)
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True, populate_by_name=True)
 
     id: str = Field(
         ...,

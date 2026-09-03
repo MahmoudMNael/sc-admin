@@ -36,6 +36,10 @@ class MongoRepository(AbstractRepository[DocT, IdT], Generic[DocT, IdT]):
         query = spec.to_mongo(self.model)
         return await self.model.find(query).skip(skip).limit(limit).to_list()
 
+    async def count(self, spec: Specification) -> int:
+        query = spec.to_mongo(self.model)
+        return await self.model.find(query).count()
+
     async def update(self, id: IdT, data: dict) -> Optional[DocT]:
         entity = await self.get_by_id(id)
         if entity is None:
