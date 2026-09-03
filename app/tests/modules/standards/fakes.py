@@ -50,12 +50,12 @@ class FakeStandardRepository(AbstractRepository[Standard, str]):
         del self.store[id]
         return True
 
-    async def get_by_qdrant_point_id(self, qdrant_point_id: int) -> Optional[Standard]:
+    async def get_by_qdrant_point_id(self, qdrant_point_id: str) -> Optional[Standard]:
         for entity in self.store.values():
             if entity.qdrant_point_id == qdrant_point_id:
                 return entity
         return None
 
-    async def get_many_by_qdrant_point_ids(self, point_ids: Sequence[int]) -> Sequence[Standard]:
+    async def get_many_by_qdrant_point_ids(self, point_ids: Sequence[str]) -> Sequence[Standard]:
         wanted = set(point_ids)
         return [entity for entity in self.store.values() if entity.qdrant_point_id in wanted]

@@ -10,6 +10,7 @@ from app.shared.specification.base import Specification
 from app.shared.specification.fields import FieldEquals
 from app.shared.specification.keyword import KeywordSpecification
 from app.shared.specification.match_all import MatchAllSpecification
+from app.shared.utils import generate_qdrant_point_id
 
 from .dto import (
     CreateManyStandardsRequest,
@@ -37,6 +38,10 @@ def compute_content_hash(data: dict[str, Any]) -> str:
     return hashlib.sha256(blob.encode()).hexdigest()
 
 
+def point_id_for(payload: CreateStandardRequest) -> str:
+    return generate_qdrant_point_id(payload.model_dump())
+
+
 class StandardService:
     def __init__(self, repository: StandardRepository):
         self.repository = repository
@@ -45,14 +50,14 @@ class StandardService:
         ids = [item.id for item in payload.items]
         if len(ids) != len(set(ids)):
             raise HTTPException(status.HTTP_400_BAD_REQUEST, "Duplicate ids within the same request batch")
-        point_ids = [item.qdrant_point_id for item in payload.items]
+        point_ids = [point_id_for(item) for item in payload.items]
         if len(point_ids) != len(set(point_ids)):
             raise HTTPException(
                 status.HTTP_400_BAD_REQUEST,
                 "Duplicate qdrant_point_id values within the same request batch",
             )
 
-    async def _ensure_point_id_free(self, qdrant_point_id: int, owner_id: str) -> None:
+    async def _ensure_point_id_free(self, qdrant_point_id: str, owner_id: str) -> None:
         occupant = await self.repository.get_by_qdrant_point_id(qdrant_point_id)
         if occupant is not None and occupant.id != owner_id:
             raise HTTPException(
@@ -64,6 +69,7 @@ class StandardService:
         data = payload.model_dump()
         return Standard(
             **data,
+            qdrant_point_id=generate_qdrant_point_id(data),
             content_hash=compute_content_hash(data),
             created_at=now,
             updated_at=now,
@@ -82,7 +88,8 @@ class StandardService:
                 f"Use PATCH /standards/{payload.id} to update it explicitly.",
             )
 
-        await self._ensure_point_id_free(payload.qdrant_point_id, payload.id)
+        qdrant_point_id = point_id_for(payload)
+        await self._ensure_point_id_free(qdrant_point_id, payload.id)
 
         now = datetime.now(timezone.utc)
         standard = self._entity_from_create(payload, now)
@@ -91,14 +98,14 @@ class StandardService:
         except DuplicateKeyError:
             raise HTTPException(
                 status.HTTP_409_CONFLICT,
-                f"qdrant_point_id {payload.qdrant_point_id} is already used",
+                f"qdrant_point_id {qdrant_point_id} is already used",
             )
         return StandardResponse.model_validate(created)
 
     async def create_many_standards(self, payload: CreateManyStandardsRequest) -> None:
         """Runs after POST /bulk returns 202. Duplicate keys in the payload were already rejected."""
         ids = [item.id for item in payload.items]
-        point_ids = [item.qdrant_point_id for item in payload.items]
+        point_ids = [point_id_for(item) for item in payload.items]
         existing_by_id = {s.id: s for s in await self.repository.get_many_by_ids(ids)}
         existing_by_point = {
             s.qdrant_point_id: s for s in await self.repository.get_many_by_qdrant_point_ids(point_ids)
@@ -110,7 +117,7 @@ class StandardService:
             current = existing_by_id.get(item.id)
             if current is not None:
                 continue  # same-hash retry or content conflict — neither is inserted
-            occupant = existing_by_point.get(item.qdrant_point_id)
+            occupant = existing_by_point.get(point_id_for(item))
             if occupant is not None:
                 continue  # point_id taken by another document — skip (HTTP already returned)
             to_insert.append(self._entity_from_create(item, now))
@@ -171,10 +178,16 @@ class StandardService:
         if not data:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, "No fields provided to update")
 
-        merged = {**existing.model_dump(), **data}
+        existing_dump = existing.model_dump()
+        if "standard_metadata" in data:
+            data["standard_metadata"] = {**existing_dump["standard_metadata"], **data["standard_metadata"]}
+        if "hierarchy" in data:
+            data["hierarchy"] = {**existing_dump["hierarchy"], **data["hierarchy"]}
+
+        merged = {**existing_dump, **data}
         data["content_hash"] = compute_content_hash(merged)
         data["updated_at"] = datetime.now(timezone.utc)
-        # qdrant_point_id is never in `data` — not on UpdateStandardRequest
+        # identity fields and qdrant_point_id are never in `data`
 
         updated = await self.repository.update(standard_id, data)
         return StandardResponse.model_validate(updated)

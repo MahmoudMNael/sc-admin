@@ -5,18 +5,33 @@ from pydantic import BaseModel, ConfigDict, Field
 
 
 class StandardMetadataDTO(BaseModel):
-    model_config = ConfigDict(extra="forbid", from_attributes=True)
+    model_config = ConfigDict(extra="forbid", from_attributes=True, str_strip_whitespace=True)
     standard_code: str = Field(..., min_length=1)
     version_year: str = Field(..., min_length=1)
     is_latest: bool
 
 
 class StandardHierarchyDTO(BaseModel):
-    model_config = ConfigDict(extra="forbid", from_attributes=True)
+    model_config = ConfigDict(extra="forbid", from_attributes=True, str_strip_whitespace=True)
     category_table_number: str = Field(..., min_length=1)
     category_title: str = Field(..., min_length=1)
     ref_number: str = Field(..., min_length=1)
     page: int = Field(..., ge=1)
+
+
+class UpdateStandardMetadataRequest(BaseModel):
+    """PATCH body for metadata. Identity fields (standard_code, version_year) are omitted — extra=forbid 422s them."""
+
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+    is_latest: bool | None = None
+
+
+class UpdateStandardHierarchyRequest(BaseModel):
+    """PATCH body for hierarchy. Identity fields (category_table_number, ref_number) are omitted — extra=forbid 422s them."""
+
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+    category_title: str | None = Field(None, min_length=1)
+    page: int | None = Field(None, ge=1)
 
 
 class StandardParametersDTO(BaseModel):
@@ -32,7 +47,7 @@ class StandardParametersDTO(BaseModel):
 
 
 class CreateStandardRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True, populate_by_name=True)
+    model_config = ConfigDict(extra="ignore", str_strip_whitespace=True, populate_by_name=True)
 
     id: str = Field(
         ...,
@@ -40,22 +55,21 @@ class CreateStandardRequest(BaseModel):
         alias="_id",
         description="Deterministic natural key, e.g. 'en12464_1_v2019_6_1_1'",
     )
-    qdrant_point_id: int  # stored as sent; unique; not computed
     standard_metadata: StandardMetadataDTO
     hierarchy: StandardHierarchyDTO
     activity: str = Field(..., min_length=1)
     parameters: StandardParametersDTO
     specific_requirements: str | None = None
     searchable_text: str = Field(..., min_length=1)
-    # content_hash is computed in the service — not a request field
+    # qdrant_point_id and content_hash are computed in the service — not request fields
 
 
 class UpdateStandardRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
-    # qdrant_point_id is immutable after create — omitting it here makes extra="forbid" 422 any PATCH that tries
-    standard_metadata: StandardMetadataDTO | None = None
-    hierarchy: StandardHierarchyDTO | None = None
+    # identity fields + qdrant_point_id are immutable — omitted so extra="forbid" 422s any PATCH that tries
+    standard_metadata: UpdateStandardMetadataRequest | None = None
+    hierarchy: UpdateStandardHierarchyRequest | None = None
     activity: str | None = Field(None, min_length=1)
     parameters: StandardParametersDTO | None = None
     specific_requirements: str | None = None
@@ -67,7 +81,7 @@ class StandardResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: str
-    qdrant_point_id: int
+    qdrant_point_id: str
     standard_metadata: StandardMetadataDTO
     hierarchy: StandardHierarchyDTO
     activity: str
@@ -80,7 +94,7 @@ class StandardResponse(BaseModel):
 
 
 class CreateManyStandardsRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="ignore")
     items: list[CreateStandardRequest] = Field(..., min_length=1)
 
 

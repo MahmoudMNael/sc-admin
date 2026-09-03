@@ -1,10 +1,14 @@
 import pytest
 from fastapi import HTTPException
 
-from app.modules.standards.dto import CreateManyStandardsRequest, UpdateStandardRequest
-from app.modules.standards.service import StandardService, compute_content_hash
+from app.modules.standards.dto import (
+    CreateManyStandardsRequest,
+    UpdateStandardMetadataRequest,
+    UpdateStandardRequest,
+)
+from app.modules.standards.service import StandardService, compute_content_hash, point_id_for
 from app.tests.modules.standards.fakes import FakeStandardRepository
-from app.tests.modules.standards.helpers import sample_payload, seed_standard
+from app.tests.modules.standards.helpers import sample_hierarchy, sample_payload, seed_standard
 
 
 def _service() -> tuple[StandardService, FakeStandardRepository]:
@@ -12,11 +16,12 @@ def _service() -> tuple[StandardService, FakeStandardRepository]:
     return StandardService(repo), repo
 
 
-async def test_create_computes_hash_and_timestamps():
+async def test_create_computes_hash_timestamps_and_point_id():
     service, repo = _service()
     payload = sample_payload()
     dumped = payload.model_dump()
     assert "content_hash" not in dumped
+    assert "qdrant_point_id" not in dumped
 
     result = await service.create_standard(payload)
 
@@ -24,9 +29,10 @@ async def test_create_computes_hash_and_timestamps():
     created = repo.create_calls[0]
     assert created.content_hash == compute_content_hash(payload.model_dump())
     assert created.content_hash == result.content_hash
+    assert created.qdrant_point_id == point_id_for(payload)
+    assert created.qdrant_point_id == result.qdrant_point_id
     assert created.created_at is not None
     assert created.updated_at == created.created_at
-    assert created.qdrant_point_id == payload.qdrant_point_id
     assert created.id == payload.id
 
 
@@ -38,6 +44,7 @@ async def test_create_identical_content_is_idempotent():
 
     assert first.id == second.id
     assert first.content_hash == second.content_hash
+    assert first.qdrant_point_id == second.qdrant_point_id
     assert len(repo.create_calls) == 1
     assert len(repo.store) == 1
 
@@ -54,7 +61,7 @@ async def test_create_taken_qdrant_point_id_conflicts():
     service, _repo = _service()
     await service.create_standard(sample_payload())
     with pytest.raises(HTTPException) as exc:
-        await service.create_standard(sample_payload(id="other_standard", qdrant_point_id=1))
+        await service.create_standard(sample_payload(id="other_standard"))
     assert exc.value.status_code == 409
 
 
@@ -71,10 +78,26 @@ async def test_patch_recomputes_hash_and_keeps_point_id():
     assert stored.content_hash == updated.content_hash
 
 
+async def test_patch_metadata_keeps_identity_fields():
+    service, _repo = _service()
+    original = await service.create_standard(sample_payload())
+    updated = await service.update_standard(
+        original.id,
+        UpdateStandardRequest(standard_metadata=UpdateStandardMetadataRequest(is_latest=False)),
+    )
+    assert updated.standard_metadata.standard_code == original.standard_metadata.standard_code
+    assert updated.standard_metadata.version_year == original.standard_metadata.version_year
+    assert updated.standard_metadata.is_latest is False
+    assert updated.qdrant_point_id == original.qdrant_point_id
+
+
 async def test_reject_duplicate_ids_in_batch():
     service, _repo = _service()
     payload = CreateManyStandardsRequest(
-        items=[sample_payload(), sample_payload(qdrant_point_id=2)],
+        items=[
+            sample_payload(),
+            sample_payload(hierarchy=sample_hierarchy(ref_number="6.1.2")),
+        ],
     )
     with pytest.raises(HTTPException) as exc:
         service.reject_duplicate_keys(payload)
@@ -94,16 +117,20 @@ async def test_reject_duplicate_point_ids_in_batch():
 async def test_create_many_inserts_only_new_items():
     service, repo = _service()
     existing = seed_standard(repo, sample_payload())
+    taken_hierarchy = sample_hierarchy(category_table_number="6.13", ref_number="6.13.1")
     taken_point = seed_standard(
         repo,
-        sample_payload(id="already_here", qdrant_point_id=99, activity="other"),
+        sample_payload(id="already_here", activity="other", hierarchy=taken_hierarchy),
     )
 
     payload = CreateManyStandardsRequest(
         items=[
             sample_payload(),  # same id as existing — skip
-            sample_payload(id="brand_new", qdrant_point_id=99),  # point taken — skip
-            sample_payload(id="genuinely_new", qdrant_point_id=7),
+            sample_payload(id="brand_new", hierarchy=taken_hierarchy),  # same identity as taken_point — skip
+            sample_payload(
+                id="genuinely_new",
+                hierarchy=sample_hierarchy(category_table_number="7.1", ref_number="7.1.1"),
+            ),
         ]
     )
     await service.create_many_standards(payload)

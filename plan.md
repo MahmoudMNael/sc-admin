@@ -82,6 +82,8 @@ app/
 │   │   ├── fields.py               # FieldEquals
 │   │   ├── keyword.py              # KeywordSpecification — multi-field keyword search
 │   │   └── match_all.py            # MatchAllSpecification — identity element for dynamic filters
+│   ├── utils/
+│   │   └── qdrant.py               # UUID v5 qdrant point id from identity fields
 │   └── repository/
 │       ├── base.py                 # AbstractRepository[Entity, ID]
 │       ├── sql_repository.py       # generic SQLAlchemy CRUD base
@@ -506,7 +508,7 @@ See `StandardService.list_standards` in Section 9 for `FieldEquals` and `Keyword
 - Every field gets an explicit `Field(...)` constraint where one makes sense (`min_length`, `ge`/`le`, etc.) rather than a bare type.
 - Always set `response_model=...` on the route — that's what drives the accurate Swagger schema and strips unintended fields, even if the service accidentally returns extra data.
 - Bulk operations get their own request/response DTOs (a wrapper `items: list[Create{X}Request]`). Long-running bulk creates may return `202 Accepted` immediately and run inserts in a FastAPI `BackgroundTasks` job — see `CreateManyStandardsRequest` / `CreateManyStandardsAcceptedResponse` in Section 9.
-- Derived fields (e.g. `content_hash`, timestamps) live on the entity/response, not on create/update requests. The service computes them before persist. Client-supplied identity fields that must not change later (e.g. `qdrant_point_id`) are on create only — omit them from `Update{X}Request` so `extra="forbid"` 422s any attempt to PATCH them.
+- Derived fields (e.g. `content_hash`, `qdrant_point_id`, timestamps) live on the entity/response, not on create/update requests. The service computes them before persist. Identity fields that must not change later (`standard_code`, `version_year`, `category_table_number`, `ref_number`, and `qdrant_point_id`) are omitted from `Update{X}Request` so `extra="forbid"` 422s any attempt to PATCH them.
 
 ---
 
@@ -542,7 +544,33 @@ Postgres-backed repositories additionally depend on `Depends(get_postgres_sessio
 
 The first real module. Mongo-backed, natural-key ID, idempotent create.
 
-Create request matches the upstream document plus `qdrant_point_id`: `_id`, `qdrant_point_id`, `standard_metadata`, `hierarchy`, `activity`, `parameters`, `specific_requirements`, `searchable_text`. Missing entity fields (`content_hash`, `created_at`, `updated_at`) are computed in the service before persist. `qdrant_point_id` is stored as sent, unique across the collection, and immutable after create.
+Create request matches the upstream document: `_id`, `standard_metadata`, `hierarchy`, `activity`, `parameters`, `specific_requirements`, `searchable_text`. Missing entity fields (`qdrant_point_id`, `content_hash`, `created_at`, `updated_at`) are computed in the service before persist.
+
+`qdrant_point_id` is a **UUID v5** of the entry's immutable identity (`standard_code|version_year|category_table_number|ref_number`) via `generate_qdrant_point_id` in `shared/utils/qdrant.py`. It is never accepted from the request. Concatenating numbers is unsafe (`6.1.3.1`+`2019` and `6.13.1`+`2019` collide); the canonical string + UUID v5 does not. `activity`, `parameters`, and `searchable_text` are attributes, not identity — changing them must not change the Qdrant id.
+
+Identity fields and `qdrant_point_id` are immutable after create. PATCH uses narrower nested DTOs (`UpdateStandardMetadataRequest` / `UpdateStandardHierarchyRequest`) that omit those fields so `extra="forbid"` 422s any attempt to edit them.
+
+```python
+# shared/utils/qdrant.py
+import uuid
+
+QDRANT_NAMESPACE = uuid.uuid5(uuid.NAMESPACE_DNS, "sc-admin.qdrant")
+
+
+def generate_qdrant_point_id(entry: dict) -> str:
+    """Stable UUID v5 from immutable identity fields — never from a client-supplied id."""
+    metadata = entry["standard_metadata"]
+    hierarchy = entry["hierarchy"]
+    canonical_key = "|".join(
+        [
+            metadata["standard_code"].strip(),
+            metadata["version_year"].strip(),
+            hierarchy["category_table_number"].strip(),
+            hierarchy["ref_number"].strip(),
+        ]
+    )
+    return str(uuid.uuid5(QDRANT_NAMESPACE, canonical_key))
+```
 
 ```python
 # modules/standards/models.py
@@ -578,7 +606,7 @@ class StandardParameters(BaseModel):
 
 class Standard(Document):
     id: str  # domain-provided natural key — also becomes Mongo's _id (see Section 10)
-    qdrant_point_id: int
+    qdrant_point_id: str  # UUID v5 of identity fields — computed, never from the request
     standard_metadata: StandardMetadata
     hierarchy: StandardHierarchy
     activity: str
@@ -610,22 +638,35 @@ from pydantic import BaseModel, ConfigDict, Field
 
 
 class StandardMetadataDTO(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", from_attributes=True, str_strip_whitespace=True)
     standard_code: str = Field(..., min_length=1)
     version_year: str = Field(..., min_length=1)
     is_latest: bool
 
 
 class StandardHierarchyDTO(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", from_attributes=True, str_strip_whitespace=True)
     category_table_number: str = Field(..., min_length=1)
     category_title: str = Field(..., min_length=1)
     ref_number: str = Field(..., min_length=1)
     page: int = Field(..., ge=1)
 
 
+class UpdateStandardMetadataRequest(BaseModel):
+    """PATCH body for metadata. Identity fields (standard_code, version_year) omitted — extra=forbid 422s them."""
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+    is_latest: bool | None = None
+
+
+class UpdateStandardHierarchyRequest(BaseModel):
+    """PATCH body for hierarchy. Identity fields (category_table_number, ref_number) omitted — extra=forbid 422s them."""
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+    category_title: str | None = Field(None, min_length=1)
+    page: int | None = Field(None, ge=1)
+
+
 class StandardParametersDTO(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", from_attributes=True)
     em_r_lx: float | None = Field(None, ge=0)
     em_u_lx: float | None = Field(None, ge=0)
     uo: float | None = Field(None, ge=0, le=1)
@@ -645,22 +686,21 @@ class CreateStandardRequest(BaseModel):
         alias="_id",
         description="Deterministic natural key, e.g. 'en12464_1_v2019_6_1_1'",
     )
-    qdrant_point_id: int  # stored as sent; unique; not computed
     standard_metadata: StandardMetadataDTO
     hierarchy: StandardHierarchyDTO
     activity: str = Field(..., min_length=1)
     parameters: StandardParametersDTO
     specific_requirements: str | None = None
     searchable_text: str = Field(..., min_length=1)
-    # content_hash is computed in the service — not a request field
+    # qdrant_point_id and content_hash are computed in the service — not request fields
 
 
 class UpdateStandardRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
-    # qdrant_point_id is immutable after create — omitting it here makes extra="forbid" 422 any PATCH that tries
-    standard_metadata: StandardMetadataDTO | None = None
-    hierarchy: StandardHierarchyDTO | None = None
+    # identity fields + qdrant_point_id are immutable — omitted so extra="forbid" 422s any PATCH that tries
+    standard_metadata: UpdateStandardMetadataRequest | None = None
+    hierarchy: UpdateStandardHierarchyRequest | None = None
     activity: str | None = Field(None, min_length=1)
     parameters: StandardParametersDTO | None = None
     specific_requirements: str | None = None
@@ -672,7 +712,7 @@ class StandardResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: str
-    qdrant_point_id: int
+    qdrant_point_id: str
     standard_metadata: StandardMetadataDTO
     hierarchy: StandardHierarchyDTO
     activity: str
@@ -704,10 +744,10 @@ from .models import Standard
 class StandardRepository(MongoRepository[Standard, str]):
     model = Standard
 
-    async def get_by_qdrant_point_id(self, qdrant_point_id: int) -> Optional[Standard]:
+    async def get_by_qdrant_point_id(self, qdrant_point_id: str) -> Optional[Standard]:
         return await self.model.find_one({"qdrant_point_id": qdrant_point_id})
 
-    async def get_many_by_qdrant_point_ids(self, point_ids: Sequence[int]) -> Sequence[Standard]:
+    async def get_many_by_qdrant_point_ids(self, point_ids: Sequence[str]) -> Sequence[Standard]:
         if not point_ids:
             return []
         return await self.model.find({"qdrant_point_id": {"$in": list(point_ids)}}).to_list()
@@ -726,6 +766,7 @@ from app.shared.specification.base import Specification
 from app.shared.specification.fields import FieldEquals
 from app.shared.specification.keyword import KeywordSpecification
 from app.shared.specification.match_all import MatchAllSpecification
+from app.shared.utils import generate_qdrant_point_id
 
 from .dto import (
     CreateManyStandardsRequest, CreateStandardRequest, StandardResponse, UpdateStandardRequest,
@@ -746,6 +787,10 @@ def compute_content_hash(data: dict[str, Any]) -> str:
     return hashlib.sha256(blob.encode()).hexdigest()
 
 
+def point_id_for(payload: CreateStandardRequest) -> str:
+    return generate_qdrant_point_id(payload.model_dump())
+
+
 class StandardService:
     def __init__(self, repository: StandardRepository):
         self.repository = repository
@@ -754,14 +799,14 @@ class StandardService:
         ids = [item.id for item in payload.items]
         if len(ids) != len(set(ids)):
             raise HTTPException(status.HTTP_400_BAD_REQUEST, "Duplicate ids within the same request batch")
-        point_ids = [item.qdrant_point_id for item in payload.items]
+        point_ids = [point_id_for(item) for item in payload.items]
         if len(point_ids) != len(set(point_ids)):
             raise HTTPException(
                 status.HTTP_400_BAD_REQUEST,
                 "Duplicate qdrant_point_id values within the same request batch",
             )
 
-    async def _ensure_point_id_free(self, qdrant_point_id: int, owner_id: str) -> None:
+    async def _ensure_point_id_free(self, qdrant_point_id: str, owner_id: str) -> None:
         occupant = await self.repository.get_by_qdrant_point_id(qdrant_point_id)
         if occupant is not None and occupant.id != owner_id:
             raise HTTPException(
@@ -773,6 +818,7 @@ class StandardService:
         data = payload.model_dump()
         return Standard(
             **data,
+            qdrant_point_id=generate_qdrant_point_id(data),
             content_hash=compute_content_hash(data),
             created_at=now,
             updated_at=now,
@@ -791,7 +837,8 @@ class StandardService:
                 f"Use PATCH /standards/{payload.id} to update it explicitly.",
             )
 
-        await self._ensure_point_id_free(payload.qdrant_point_id, payload.id)
+        qdrant_point_id = point_id_for(payload)
+        await self._ensure_point_id_free(qdrant_point_id, payload.id)
 
         now = datetime.now(timezone.utc)
         standard = self._entity_from_create(payload, now)
@@ -800,14 +847,14 @@ class StandardService:
         except DuplicateKeyError:
             raise HTTPException(
                 status.HTTP_409_CONFLICT,
-                f"qdrant_point_id {payload.qdrant_point_id} is already used",
+                f"qdrant_point_id {qdrant_point_id} is already used",
             )
         return StandardResponse.model_validate(created)
 
     async def create_many_standards(self, payload: CreateManyStandardsRequest) -> None:
         """Runs after POST /bulk returns 202. Duplicate keys in the payload were already rejected."""
         ids = [item.id for item in payload.items]
-        point_ids = [item.qdrant_point_id for item in payload.items]
+        point_ids = [point_id_for(item) for item in payload.items]
         existing_by_id = {s.id: s for s in await self.repository.get_many_by_ids(ids)}
         existing_by_point = {
             s.qdrant_point_id: s
@@ -817,11 +864,10 @@ class StandardService:
         now = datetime.now(timezone.utc)
         to_insert: list[Standard] = []
         for item in payload.items:
-            content_hash = compute_content_hash(item.model_dump())
             current = existing_by_id.get(item.id)
             if current is not None:
                 continue  # same-hash retry or content conflict — neither is inserted
-            occupant = existing_by_point.get(item.qdrant_point_id)
+            occupant = existing_by_point.get(point_id_for(item))
             if occupant is not None:
                 continue  # point_id taken by another document — skip (HTTP already returned)
             to_insert.append(self._entity_from_create(item, now))
@@ -881,10 +927,16 @@ class StandardService:
         if not data:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, "No fields provided to update")
 
-        merged = {**existing.model_dump(), **data}
+        existing_dump = existing.model_dump()
+        if "standard_metadata" in data:
+            data["standard_metadata"] = {**existing_dump["standard_metadata"], **data["standard_metadata"]}
+        if "hierarchy" in data:
+            data["hierarchy"] = {**existing_dump["hierarchy"], **data["hierarchy"]}
+
+        merged = {**existing_dump, **data}
         data["content_hash"] = compute_content_hash(merged)
         data["updated_at"] = datetime.now(timezone.utc)
-        # qdrant_point_id is never in `data` — not on UpdateStandardRequest
+        # identity fields and qdrant_point_id are never in `data`
 
         updated = await self.repository.update(standard_id, data)
         return StandardResponse.model_validate(updated)
@@ -987,23 +1039,23 @@ StandardServiceDep = Annotated[StandardService, Depends(get_standard_service)]
 
 The `id` field (e.g. `"en12464_1_v2019_6_1_1"`) is a **deterministic natural key** — the upstream source derives it from the standard's identity (code + version + ref number), not a random surrogate. It's used directly as Beanie's `id`/Mongo's `_id`, which means the database itself guarantees no two documents can ever share it. The create request sends it as `_id` (Pydantic alias).
 
-`content_hash` is **computed** by the service (SHA-256 of canonical JSON over `HASH_FIELDS`: metadata, hierarchy, activity, parameters, specific_requirements, searchable_text). It is never a request field. `qdrant_point_id` is **not** in the hash — it is a separate unique identity, stored as sent.
+`content_hash` is **computed** by the service (SHA-256 of canonical JSON over `HASH_FIELDS`: metadata, hierarchy, activity, parameters, specific_requirements, searchable_text). It is never a request field. `qdrant_point_id` is **not** in the hash — it is a separate unique identity, a UUID v5 of `standard_code|version_year|category_table_number|ref_number` via `generate_qdrant_point_id`. It is never a request field.
 
-`qdrant_point_id` is unique (`IndexModel(..., unique=True)` plus a pre-insert lookup). A second document that reuses a point id is **`409 Conflict`**. PATCH cannot change it (`UpdateStandardRequest` omits the field).
+`qdrant_point_id` is unique (`IndexModel(..., unique=True)` plus a pre-insert lookup). Two documents that hash to the same identity (same four fields, different `_id`) are **`409 Conflict`**. PATCH cannot change the point id or those four identity fields (`UpdateStandardRequest` / nested update DTOs omit them).
 
 | Situation | Outcome |
 | --- | --- |
-| No document with this `id`, `qdrant_point_id` free | **Insert.** Hash and timestamps computed. Point id stored as sent. |
-| Same `id`, **same** computed `content_hash` | **No-op success**, existing record returned. Safe retry. Stored point id is kept even if the retry sent a different one. |
-| Same `id`, **different** computed `content_hash` | **`409 Conflict`.** Caller must `PATCH /standards/{id}`. |
-| New `id`, `qdrant_point_id` already used by another document | **`409 Conflict`.** Unique index is the race backstop (`DuplicateKeyError` → 409). |
-| Duplicate `id`s **or** duplicate `qdrant_point_id`s inside one `create_many` payload | **`400 Bad Request`.** Client-side bug, rejected before the background job is queued. |
+| No document with this `id`, computed `qdrant_point_id` free | **Insert.** Hash, timestamps, and UUID v5 point id computed. |
+| Same `id`, **same** computed `content_hash` | **No-op success**, existing record returned. Safe retry. Stored point id is kept. |
+| Same `id`, **different** computed `content_hash` | **`409 Conflict`.** Caller must `PATCH /standards/{id}` (cannot change identity fields). |
+| New `id`, computed `qdrant_point_id` already used by another document | **`409 Conflict`.** Unique index is the race backstop (`DuplicateKeyError` → 409). |
+| Duplicate `id`s **or** duplicate computed `qdrant_point_id`s (same identity fields) inside one `create_many` payload | **`400 Bad Request`.** Client-side bug, rejected before the background job is queued. |
 
 `POST /standards/bulk` validates the batch (schema + `reject_duplicate_keys`) then returns **`202 Accepted`** with `{status: "accepted", item_count: N}` and runs `create_many_standards` in a FastAPI `BackgroundTasks` job. The worker applies the same per-item insert/skip rules but **does not** report outcomes back — the HTTP response has already been sent.
 
 > Ceiling: `BackgroundTasks` are in-process; a crash loses the job and there is no status endpoint. Upgrade to a real queue (or a job document) if bulk ingest must be durable.
 
-This pattern (natural key as the DB id + a computed content fingerprint + a unique client-supplied point id) generalizes to any future module ingesting externally-sourced, re-importable data. For modules where the DB should own identity, skip this — a normal auto-generated ID with a plain `create`/`409-if-exists` is enough.
+This pattern (natural key as the DB id + a computed content fingerprint + a UUID v5 point id from immutable identity fields) generalizes to any future module ingesting externally-sourced, re-importable data. For modules where the DB should own identity, skip this — a normal auto-generated ID with a plain `create`/`409-if-exists` is enough.
 
 ---
 
@@ -1011,7 +1063,7 @@ This pattern (natural key as the DB id + a computed content fingerprint + a uniq
 
 1. Create `modules/<name>/` with the six files: `models.py`, `dto.py`, `repository.py`, `service.py`, `controller.py`, `dependencies.py`.
 2. **`models.py`**: define the entity — a Beanie `Document` (Mongo) or a `Mapped[...]` SQLAlchemy class (Postgres). Decide the ID strategy up front (auto-generated vs. natural key) — it determines whether you need Standards-style idempotency logic.
-3. **`dto.py`**: `Create{X}Request`, `Update{X}Request` (all optional), `{X}Response`, plus bulk variants if needed. `extra="forbid"` + explicit `Field` constraints on everything. Derived fields (`content_hash`, timestamps) and immutable fields (`qdrant_point_id` after create) stay off the request models they don't belong on.
+3. **`dto.py`**: `Create{X}Request`, `Update{X}Request` (all optional), `{X}Response`, plus bulk variants if needed. `extra="forbid"` + explicit `Field` constraints on everything. Derived fields (`content_hash`, `qdrant_point_id`, timestamps) and immutable identity fields stay off the request models they don't belong on.
 4. **`repository.py`**: subclass `SQLRepository[Model]` or `MongoRepository[Model, IdType]`, set `model = ...`, add custom queries only if `find(spec)` genuinely can't express them.
 5. **`service.py`**: business logic only — DTO↔entity mapping, idempotency/business rules, `HTTPException` for domain errors (404/409/etc). Define a `SEARCHABLE_FIELDS` allowlist here if the module needs keyword search.
 6. **`controller.py`**: thin routes, `response_model` on every one, delegate to the service via its `*ServiceDep` alias. Static paths (`/search`, `/bulk`) before `/{id}` paths.
@@ -1138,15 +1190,16 @@ LOCAL_STORAGE_PATH=./uploads
 
 **Hard rule: tests must not persist anything.** No Mongo, no Postgres, no files on disk, no TestClient lifespan that calls `init_mongo`. A fake in-memory repository (a dict behind `AbstractRepository`) is the only store. If a test would need a real database or `./uploads` to pass, the test is wrong.
 
-- **Service tests**: inject a `FakeStandardRepository`. Assert the happy path (computed `content_hash` / timestamps, idempotent skip) and the error path (`HTTPException` 400/404/409). Nothing is written outside the fake.
-  - Create payload has `_id` + `qdrant_point_id` and **no** `content_hash`; the entity the fake received has a computed hash and timestamps.
+- **Service tests**: inject a `FakeStandardRepository`. Assert the happy path (computed `content_hash` / `qdrant_point_id` / timestamps, idempotent skip) and the error path (`HTTPException` 400/404/409). Nothing is written outside the fake.
+  - Create payload has `_id` and **no** `content_hash` or `qdrant_point_id`; the entity the fake received has a computed hash, UUID v5 point id, and timestamps.
   - `create_standard` called twice with identical content → second call returns the existing record, fake `create` is not called again.
   - `create_standard` with the same `id` but different content → `409`.
-  - `create_standard` with a new `id` but a `qdrant_point_id` already used → `409`.
-  - PATCH of content recomputes the hash and leaves `qdrant_point_id` untouched.
-  - `reject_duplicate_keys` with a repeated `id` or a repeated `qdrant_point_id` in one payload → `400`.
+  - `create_standard` with a new `id` but the same identity fields (same computed `qdrant_point_id`) → `409`.
+  - PATCH of content recomputes the hash and leaves `qdrant_point_id` and identity fields untouched.
+  - `reject_duplicate_keys` with a repeated `id` or a repeated computed `qdrant_point_id` in one payload → `400`.
   - `create_many_standards` (the worker) inserts only genuinely new items into the fake; same-id retries and taken point ids are skipped.
-- **Controller tests**: `httpx.AsyncClient` against an app that **does not** run the production lifespan, with `app.dependency_overrides[get_standard_service] = lambda: FakeStandardService()`. Assert status codes and response bodies (flow + errors). Pydantic 422s (unknown fields, `qdrant_point_id` / `content_hash` on PATCH) live here. `POST /bulk` returns **202** with `item_count` without waiting on inserts.
+- **Controller tests**: `httpx.AsyncClient` against an app that **does not** run the production lifespan, with `app.dependency_overrides[get_standard_service] = lambda: FakeStandardService()`. Assert status codes and response bodies (flow + errors). Pydantic 422s (unknown fields, `qdrant_point_id` on create, identity fields / `qdrant_point_id` / `content_hash` on PATCH) live here. `POST /bulk` returns **202** with `item_count` without waiting on inserts.
+- **Helper tests**: `generate_qdrant_point_id` is stable for the same identity, differs for `6.1|6.1.3.1` vs `6.13|6.13.1`, and ignores `activity`.
 - **No repository/integration tests against a live engine.** Unique indexes and query plans are not the unit-test suite's job. Docker Compose is for local *running* of the app, not for pytest.
 
 ---

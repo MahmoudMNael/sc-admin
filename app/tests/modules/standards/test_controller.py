@@ -4,7 +4,8 @@ from httpx import ASGITransport, AsyncClient
 
 from app.modules.standards.controller import router
 from app.modules.standards.dependencies import get_standard_service
-from app.tests.modules.standards.helpers import FakeStandardService, sample_json
+from app.modules.standards.service import point_id_for
+from app.tests.modules.standards.helpers import FakeStandardService, sample_hierarchy, sample_json, sample_payload
 
 
 def _app(service: FakeStandardService | None = None) -> tuple[FastAPI, FakeStandardService]:
@@ -32,7 +33,7 @@ async def test_create_returns_201(client: AsyncClient):
     assert response.status_code == 201
     body = response.json()
     assert body["id"] == "en12464_1_v2019_6_1_1"
-    assert body["qdrant_point_id"] == 1
+    assert body["qdrant_point_id"] == point_id_for(sample_payload())
     assert "content_hash" in body
     assert body["content_hash"]
     assert "created_at" in body
@@ -46,15 +47,32 @@ async def test_create_unknown_field_422(client: AsyncClient):
     assert response.status_code == 422
 
 
+async def test_create_rejects_client_qdrant_point_id(client: AsyncClient):
+    payload = sample_json()
+    payload["qdrant_point_id"] = "00000000-0000-0000-0000-000000000000"
+    response = await client.post("/api/v1/standards/", json=payload)
+    assert response.status_code == 422
+
+
 async def test_bulk_returns_202_without_blocking(client: AsyncClient):
-    payload = {"items": [sample_json(), sample_json(id="second", qdrant_point_id=2)]}
+    payload = {
+        "items": [
+            sample_json(),
+            sample_json(id="second", hierarchy=sample_hierarchy(ref_number="6.1.2")),
+        ]
+    }
     response = await client.post("/api/v1/standards/bulk", json=payload)
     assert response.status_code == 202
     assert response.json() == {"status": "accepted", "item_count": 2}
 
 
 async def test_bulk_duplicate_ids_400(client: AsyncClient):
-    payload = {"items": [sample_json(), sample_json(qdrant_point_id=2)]}
+    payload = {
+        "items": [
+            sample_json(),
+            sample_json(hierarchy=sample_hierarchy(ref_number="6.1.2")),
+        ]
+    }
     response = await client.post("/api/v1/standards/bulk", json=payload)
     assert response.status_code == 400
 
@@ -63,7 +81,21 @@ async def test_patch_rejects_qdrant_point_id(client: AsyncClient):
     await client.post("/api/v1/standards/", json=sample_json())
     response = await client.patch(
         "/api/v1/standards/en12464_1_v2019_6_1_1",
-        json={"qdrant_point_id": 99},
+        json={"qdrant_point_id": "00000000-0000-0000-0000-000000000000"},
+    )
+    assert response.status_code == 422
+
+
+async def test_patch_rejects_identity_fields(client: AsyncClient):
+    await client.post("/api/v1/standards/", json=sample_json())
+    response = await client.patch(
+        "/api/v1/standards/en12464_1_v2019_6_1_1",
+        json={"standard_metadata": {"standard_code": "other", "is_latest": False}},
+    )
+    assert response.status_code == 422
+    response = await client.patch(
+        "/api/v1/standards/en12464_1_v2019_6_1_1",
+        json={"hierarchy": {"ref_number": "9.9.9", "page": 1}},
     )
     assert response.status_code == 422
 
@@ -91,13 +123,20 @@ async def test_delete_204(client: AsyncClient):
     assert missing.status_code == 404
 
 
-async def test_openapi_update_omits_immutable_fields(client: AsyncClient):
+async def test_openapi_omits_computed_and_immutable_fields(client: AsyncClient):
     spec = (await client.get("/openapi.json")).json()
-    update = spec["components"]["schemas"]["UpdateStandardRequest"]
+    schemas = spec["components"]["schemas"]
+    create = schemas["CreateStandardRequest"]
+    assert "qdrant_point_id" not in create.get("properties", {})
+    assert "content_hash" not in create.get("properties", {})
+    update = schemas["UpdateStandardRequest"]
     props = update.get("properties", {})
     assert "qdrant_point_id" not in props
     assert "content_hash" not in props
     assert update.get("additionalProperties") is False
-    create = spec["components"]["schemas"]["CreateStandardRequest"]
-    assert "_id" in create["properties"] or "id" in create["properties"]
-    assert "content_hash" not in create.get("properties", {})
+    meta = schemas["UpdateStandardMetadataRequest"]["properties"]
+    assert "standard_code" not in meta
+    assert "version_year" not in meta
+    hier = schemas["UpdateStandardHierarchyRequest"]["properties"]
+    assert "category_table_number" not in hier
+    assert "ref_number" not in hier

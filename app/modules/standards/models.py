@@ -31,7 +31,7 @@ class StandardParameters(BaseModel):
 
 class Standard(Document):
     id: str  # domain-provided natural key — also becomes Mongo's _id (see Section 10)
-    qdrant_point_id: int
+    qdrant_point_id: str  # UUID v5 of identity fields — computed, never from the request
     standard_metadata: StandardMetadata
     hierarchy: StandardHierarchy
     activity: str
