@@ -1,14 +1,14 @@
 # FastAPI Modular CRUD Architecture — Repository Pattern (Dual ORM + Local File Storage)
 
-**Standards is the first implemented module.** Every future module (Postgres or Mongo, with or without file storage) should mirror its shape exactly — see Section 11 for the checklist.
+**Standards is the first HTTP module (Mongo).** Assets is the first file-upload module. Fixtures is the first nested Postgres CRUD module (asset UUIDs, not uploads). Mirror Standards for JSON HTTP shape, assets for files, and assets/fixtures for SQL persistence — see Section 11.
 
 ## 1. Goals & Constraints
 
 - **Layers**: `Controller → Service → Repository → (Postgres | MongoDB | Local FS)`. Services hold business logic; controllers stay thin (validation + delegation); repositories only know how to talk to a single data source.
 - **Two ORMs, one pattern**: SQLAlchemy 2.x (async) for Postgres, Beanie (async, built on Motor + Pydantic) for MongoDB. Both are hidden behind the same repository abstraction so services never import `sqlalchemy` or `beanie` directly.
-- **File uploads are a repository too**: local filesystem storage is abstracted the same way DB access is, so it can be swapped for S3/GCS later without touching services. (No module needs this yet — the abstraction is ready for when one does.)
+- **File uploads are a repository too**: `AbstractFileStorage` / `LocalFileStorage`. Assets injects it next to `AssetRepository`. Swap for S3/GCS later without touching the service.
 - **Feature-based modules**: every domain concept lives in its own folder with `controller.py`, `service.py`, `repository.py`, `models.py` (ORM/ODM entities), `dto.py` (Pydantic schemas), `dependencies.py` (DI wiring).
-- **Consistent JSON envelope**: successes are `{success: true, data, pagination}` (`ApiResponse[T]`). Collection GET fills pagination from `page`/`limit` query params; other JSON routes set `pagination` to `null`. Errors stay `{detail: ...}`; DELETE stays 204.
+- **Consistent JSON envelope**: successes are `{success: true, data, pagination}` (`ApiResponse[T]`). Collection GET fills pagination from `page`/`limit` query params; other JSON routes set `pagination` to `null`. Errors stay `{detail: ...}`; DELETE stays 204. **Exception**: `GET /assets/{id}` returns the file stream (`StreamingResponse`), not the envelope.
 - **Strict validation everywhere**: every request/response body is a distinct Pydantic model with `extra="forbid"`, explicit `Field` constraints, and shows up correctly in Swagger via `response_model`.
 - **DI**: native FastAPI `Depends` + `Annotated` aliases — no extra DI framework needed for a CRUD app.
 - **Idempotent writes**: modules built around externally-sourced, deterministic data (like Standards) treat `create` as safe to retry; bulk create is accepted asynchronously — see Section 10.
@@ -26,7 +26,7 @@ uvicorn[standard]
 pydantic>=2
 pydantic-settings
 
-# Postgres (SQLAlchemy async) — infra ready, no module uses it yet
+# Postgres (SQLAlchemy async) — used by assets + fixtures
 sqlalchemy>=2
 asyncpg
 alembic
@@ -59,6 +59,12 @@ pip install fastapi "uvicorn[standard]" pydantic pydantic-settings \
 ## 3. Folder Structure
 
 ```
+alembic.ini                     # Alembic config — DSN comes from Settings, not this file
+alembic/
+├── env.py                       # async engine, Base.metadata, imports SQL module models
+├── script.py.mako
+└── versions/
+    └── 0001_assets_fixtures.py  # assets + fixture tables
 app/
 ├── main.py                      # app factory, router registration, lifespan
 ├── core/
@@ -67,13 +73,13 @@ app/
 │   └── logging.py
 ├── db/
 │   ├── postgres/
-│   │   ├── base.py                # SQLAlchemy declarative Base (unused until first SQL module)
-│   │   └── session.py             # async engine + session dependency
+│   │   ├── base.py                # SQLAlchemy declarative Base
+│   │   └── session.py             # async engine + session dependency + dispose_postgres()
 │   └── mongo/
 │       └── client.py              # Motor client + init_beanie()
 ├── storage/
-│   ├── base.py                    # AbstractFileStorage interface (unused until first upload module)
-│   └── local.py                   # LocalFileStorage implementation
+│   ├── base.py                    # AbstractFileStorage — save, delete, iter_bytes, get_absolute_path
+│   └── local.py                   # LocalFileStorage (LOCAL_STORAGE_PATH)
 ├── shared/
 │   ├── dto/
 │   │   ├── error.py                # ErrorResponse schema
@@ -81,7 +87,7 @@ app/
 │   │   └── response.py             # ApiResponse[T] — {success, data, pagination}
 │   ├── specification/
 │   │   ├── base.py                 # Specification[Model] — ORM-agnostic composable criteria
-│   │   ├── fields.py               # FieldEquals
+│   │   ├── fields.py               # FieldEquals, ArrayContains
 │   │   ├── keyword.py              # KeywordSpecification — multi-field keyword search
 │   │   └── match_all.py            # MatchAllSpecification — identity element for dynamic filters
 │   ├── utils/
@@ -91,12 +97,26 @@ app/
 │       ├── sql_repository.py       # generic SQLAlchemy CRUD base
 │       └── mongo_repository.py     # generic Beanie CRUD base
 ├── modules/
-│   └── standards/                  # ← first real module, mirror this shape for every new one
-│       ├── controller.py
-│       ├── service.py
-│       ├── repository.py
+│   ├── standards/                  # Mongo HTTP module — mirror this shape for new HTTP modules
+│   │   ├── controller.py
+│   │   ├── service.py
+│   │   ├── repository.py
+│   │   ├── models.py
+│   │   ├── dto.py
+│   │   └── dependencies.py
+│   ├── assets/                     # shared file-catalog (Postgres + local FS)
+│   │   ├── models.py
+│   │   ├── repository.py
+│   │   ├── dto.py
+│   │   ├── service.py
+│   │   ├── controller.py
+│   │   └── dependencies.py
+│   └── fixtures/                   # Postgres catalog — JSON CRUD, asset UUID FKs
 │       ├── models.py
+│       ├── repository.py
 │       ├── dto.py
+│       ├── service.py
+│       ├── controller.py
 │       └── dependencies.py
 └── tests/                       # in-memory only — never a real DB or filesystem (Section 15)
     ├── conftest.py              # dummy Beanie document settings; no init_mongo
@@ -105,7 +125,9 @@ app/
     │   ├── test_qdrant.py
     │   └── test_specification.py
     └── modules/
-        └── standards/...
+        ├── standards/...
+        ├── assets/...
+        └── fixtures/...
 ```
 
 ---
@@ -171,73 +193,83 @@ class AbstractRepository(ABC, Generic[EntityT, IdT]):
 
 ### 5b. SQLAlchemy (Postgres) generic base
 
-Assumes every SQLAlchemy model exposes its primary key as `.id` (as `Product`, `Order`, etc. would).
+Assumes every SQLAlchemy model exposes its primary key as `.id`. Generic over the ID type (assets/fixtures use `uuid.UUID`). Subclasses override `_options()` with `selectinload(...)` so async code never lazy-loads. `create` / `update` re-fetch via `get_by_id` so those options apply ( `refresh` does not populate relationships). `get_one(spec)` is the unique-lookup helper (e.g. `relative_path`).
 
 ```python
 # shared/repository/sql_repository.py
-from typing import Generic, TypeVar, Type, Optional, Sequence
+from typing import Any, Generic, TypeVar, Type, Optional, Sequence
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.shared.repository.base import AbstractRepository
 from app.shared.specification.base import Specification
 
 ModelT = TypeVar("ModelT")
+IdT = TypeVar("IdT")
 
-class SQLRepository(AbstractRepository[ModelT, int], Generic[ModelT]):
+class SQLRepository(AbstractRepository[ModelT, IdT], Generic[ModelT, IdT]):
     model: Type[ModelT]
 
     def __init__(self, session: AsyncSession):
         self.session = session
 
+    def _options(self) -> Sequence[Any]:
+        return ()
+
+    def _select(self):
+        return select(self.model).options(*self._options())
+
     async def create(self, entity: ModelT) -> ModelT:
         self.session.add(entity)
         await self.session.commit()
-        await self.session.refresh(entity)
-        return entity
+        loaded = await self.get_by_id(entity.id)
+        return loaded if loaded is not None else entity
 
     async def create_many(self, entities: Sequence[ModelT]) -> Sequence[ModelT]:
         if not entities:
             return []
         self.session.add_all(entities)
         await self.session.commit()
-        for entity in entities:
-            await self.session.refresh(entity)
-        return entities
+        return await self.get_many_by_ids([entity.id for entity in entities])
 
-    async def get_by_id(self, id: int) -> Optional[ModelT]:
-        return await self.session.get(self.model, id)
+    async def get_by_id(self, id: IdT) -> Optional[ModelT]:
+        return await self.session.get(self.model, id, options=self._options())
 
-    async def get_many_by_ids(self, ids: Sequence[int]) -> Sequence[ModelT]:
+    async def get_many_by_ids(self, ids: Sequence[IdT]) -> Sequence[ModelT]:
         if not ids:
             return []
-        result = await self.session.execute(select(self.model).where(self.model.id.in_(ids)))
-        return result.scalars().all()
+        result = await self.session.execute(self._select().where(self.model.id.in_(ids)))
+        rows = result.scalars().all()
+        by_id = {row.id: row for row in rows}
+        return [by_id[i] for i in ids if i in by_id]
 
     async def list(self, skip: int = 0, limit: int = 100) -> Sequence[ModelT]:
-        result = await self.session.execute(select(self.model).offset(skip).limit(limit))
+        result = await self.session.execute(self._select().offset(skip).limit(limit))
         return result.scalars().all()
 
     async def find(self, spec: Specification, skip: int = 0, limit: int = 100) -> Sequence[ModelT]:
-        stmt = select(self.model).where(spec.to_sql(self.model)).offset(skip).limit(limit)
+        stmt = self._select().where(spec.to_sql(self.model)).offset(skip).limit(limit)
         result = await self.session.execute(stmt)
         return result.scalars().all()
+
+    async def get_one(self, spec: Specification) -> Optional[ModelT]:
+        rows = await self.find(spec, skip=0, limit=1)
+        return rows[0] if rows else None
 
     async def count(self, spec: Specification) -> int:
         stmt = select(func.count()).select_from(self.model).where(spec.to_sql(self.model))
         return await self.session.scalar(stmt) or 0
 
-    async def update(self, id: int, data: dict) -> Optional[ModelT]:
-        entity = await self.get_by_id(id)
+    async def update(self, id: IdT, data: dict) -> Optional[ModelT]:
+        entity = await self.session.get(self.model, id)
         if entity is None:
             return None
         for key, value in data.items():
             setattr(entity, key, value)
         await self.session.commit()
-        await self.session.refresh(entity)
-        return entity
+        return await self.get_by_id(id)
 
-    async def delete(self, id: int) -> bool:
-        entity = await self.get_by_id(id)
+    async def delete(self, id: IdT) -> bool:
+        entity = await self.session.get(self.model, id)
         if entity is None:
             return False
         await self.session.delete(entity)
@@ -305,65 +337,36 @@ class MongoRepository(AbstractRepository[DocT, IdT], Generic[DocT, IdT]):
         return True
 ```
 
-### 5d. Local file storage (ready for the first upload module)
+### 5d. Local file storage (used by assets)
+
+`save` returns `(relative_path, size_bytes)` counted while writing. `iter_bytes` streams reads and raises `FileNotFoundError` if the key is missing. `get_absolute_path` must refuse paths that escape the storage root.
 
 ```python
 # storage/base.py
 from abc import ABC, abstractmethod
+from collections.abc import AsyncIterator
 from pathlib import Path
 from fastapi import UploadFile
 
 class AbstractFileStorage(ABC):
     @abstractmethod
-    async def save(self, file: UploadFile, subfolder: str = "") -> str:
-        """Persist the file, return a relative path/key usable to retrieve it later."""
+    async def save(self, file: UploadFile, subfolder: str = "") -> tuple[str, int]:
+        """Persist the file. Return (relative path/key, size in bytes)."""
 
     @abstractmethod
     async def delete(self, relative_path: str) -> bool: ...
 
     @abstractmethod
     def get_absolute_path(self, relative_path: str) -> Path: ...
+
+    @abstractmethod
+    def iter_bytes(self, relative_path: str) -> AsyncIterator[bytes]:
+        """Yield file bytes. Raise FileNotFoundError if missing."""
 ```
 
-```python
-# storage/local.py
-from pathlib import Path
-from uuid import uuid4
-import aiofiles
-from fastapi import UploadFile
-from .base import AbstractFileStorage
+`LocalFileStorage` writes under `LOCAL_STORAGE_PATH` with a uuid filename (keeps the original suffix), reads/writes in 1MiB aiofiles chunks, and guards `get_absolute_path` with `is_relative_to`.
 
-class LocalFileStorage(AbstractFileStorage):
-    def __init__(self, base_path: str):
-        self.base_path = Path(base_path)
-        self.base_path.mkdir(parents=True, exist_ok=True)
-
-    async def save(self, file: UploadFile, subfolder: str = "") -> str:
-        target_dir = self.base_path / subfolder
-        target_dir.mkdir(parents=True, exist_ok=True)
-
-        ext = Path(file.filename or "").suffix
-        filename = f"{uuid4().hex}{ext}"
-        relative_path = f"{subfolder}/{filename}" if subfolder else filename
-
-        async with aiofiles.open(target_dir / filename, "wb") as out:
-            while chunk := await file.read(1024 * 1024):
-                await out.write(chunk)
-
-        return relative_path
-
-    async def delete(self, relative_path: str) -> bool:
-        path = self.base_path / relative_path
-        if path.exists():
-            path.unlink()
-            return True
-        return False
-
-    def get_absolute_path(self, relative_path: str) -> Path:
-        return self.base_path / relative_path
-```
-
-When a future module needs file storage, inject `AbstractFileStorage` into its service alongside its DB repository (two providers composed in one `dependencies.py`, same as any other multi-dependency service) — the service saves the file, then persists its metadata via the DB repo.
+Assets injects `AbstractFileStorage` next to `AssetRepository` in `dependencies.py`. The service saves under subfolder `assets`, then inserts the `Asset` row; if the DB write fails it deletes the stored file. Tests use an in-memory `FakeFileStorage` — never `LocalFileStorage` (its `__init__` mkdir's the root).
 
 ---
 
@@ -452,6 +455,20 @@ class FieldEquals(Specification):
 
     def to_mongo(self, model):
         return {self.field: self.value}
+
+
+class ArrayContains(Specification):
+    """True when array column `field` contains `value` (Postgres `@>`, Mongo element match)."""
+
+    def __init__(self, field: str, value: Any):
+        self.field = field
+        self.value = value
+
+    def to_sql(self, model):
+        return getattr(model, self.field).contains([self.value])
+
+    def to_mongo(self, model):
+        return {self.field: self.value}
 ```
 
 ```python
@@ -513,7 +530,7 @@ class MatchAllSpecification(Specification):
 >
 > **Perf note (Mongo)**: `$regex` scans without an index. For large text-heavy collections, create a MongoDB text index and swap `KeywordSpecification.to_mongo`'s internals for a `$text: {$search: ...}` variant — the `Specification` interface doesn't change.
 
-See `StandardService.list_standards` in Section 9 for `FieldEquals` and `KeywordSpecification` composed together against a real set of optional filters.
+See `StandardService.list_standards` in Section 9 for `FieldEquals` and `KeywordSpecification` composed together. Fixtures use `ArrayContains` for `TEXT[]` tags (`applications`, protections).
 
 ---
 
@@ -1120,6 +1137,39 @@ StandardServiceDep = Annotated[StandardService, Depends(get_standard_service)]
 
 ---
 
+## 9b. Assets & Fixtures — Postgres persistence
+
+First SQL modules. UUID v4 primary keys.
+
+**Assets** (`modules/assets/`) is a shared file catalog, not owned by fixtures. `relative_path` is the `AbstractFileStorage` key (unique). Other modules attach files by storing `assets.id`. No reverse collections on `Asset` (assets must not import fixtures).
+
+HTTP (`/api/v1/assets`):
+
+- `POST /` — multipart `file`. Saves via `LocalFileStorage` (`subfolder="assets"`), then inserts `Asset`. 201 `ApiResponse[AssetResponse]`.
+- `GET /` — DB rows. `PaginationQuery` + optional `name` (case-insensitive substring on `original_filename` via `KeywordSpecification` / `SEARCHABLE_FIELDS = ["original_filename"]`). 200 `ApiResponse[list[AssetResponse]]` with pagination.
+- `GET /{asset_id}` — **file stream** (`StreamingResponse`), not the JSON envelope. 404 `{detail: ...}` if the row or bytes are missing.
+
+No DELETE/PATCH. `AssetResponse`: `id`, `relative_path`, `original_filename`, `mime_type`, `size_bytes`, `created_at`.
+
+**Fixtures** (`modules/fixtures/`) FKs to assets: `ies_file_id` (required), `model_3d_file_id` (nullable), `image_file_id`. Parent→child **CASCADE**; asset FKs **RESTRICT**. Upload stays on `/assets`; fixtures only store UUIDs. Writes are one resource per request (`SQLRepository` commits per call — no nested create of fixture+variants in one body).
+
+HTTP (`/api/v1/fixtures`):
+
+- `POST /` / `GET /` / `GET /{id}` / `PATCH /{id}` / `DELETE /{id}` (204). List is `FixtureSummaryResponse` (no variants). Get-by-id is `FixtureResponse` via `get_with_variants`.
+- List filters: `q` (`KeywordSpecification` on `manufacturer_name` + `name`), `application` (`ArrayContains`), `is_main_solution`.
+- `POST/GET/PATCH/DELETE /{id}/variants/...` — duplicate `(fixture_id, name)` is 409; missing/mismatched parent is 404. GET is `VariantDetailResponse` via `get_with_fixture` (parent `FixtureSummaryResponse`, no nested variants). POST/PATCH stay `VariantResponse`.
+- `POST/DELETE /{id}/variants/{vid}/images/...` — `{image_file_id}`; duplicate pair is 409.
+
+Asset FKs are checked with `AssetRepository.get_by_id` before insert (404 `"Asset not found"`). DTO unique-list validators cover applications / protections (PG cannot CHECK `DISTINCT unnest`).
+
+`fixture_applications` is **not** a child table: `fixtures.applications` is `TEXT[]` of `{interior, industrial}` (“both” = both values). Same for variant `mechanical_protections` / `electrical_protections`.
+
+Repositories subclass `SQLRepository[Model, UUID]`. Default `_options()` `selectinload`s to-one `Asset` FKs (and variant images). Extra commands: `FixtureRepository.get_with_variants(id)` and `FixtureVariantRepository.get_with_fixture(id)` (fixture + `ies_file` only — not the sibling variants graph). List/find do not load those. Unique lookups use `get_one(FieldEquals(...))`. DI: `Depends(get_postgres_session)` in each `dependencies.py`.
+
+Alembic: `alembic/env.py` reads `POSTGRES_DSN`, imports both model modules. Initial revision `0001_assets_fixtures`. Run `alembic upgrade head`. DSN must be `postgresql+asyncpg://...`.
+
+---
+
 ## 10. Idempotency, uniqueness, and bulk create
 
 The `id` field (e.g. `"en12464_1_v2019_6_1_1"`) is a **deterministic natural key** — the upstream source derives it from the standard's identity (code + version + ref number), not a random surrogate. It's used directly as Beanie's `id`/Mongo's `_id`, which means the database itself guarantees no two documents can ever share it. The create request sends it as `_id` (Pydantic alias).
@@ -1149,11 +1199,11 @@ This pattern (natural key as the DB id + a computed content fingerprint + a UUID
 1. Create `modules/<name>/` with the six files: `models.py`, `dto.py`, `repository.py`, `service.py`, `controller.py`, `dependencies.py`.
 2. **`models.py`**: define the entity — a Beanie `Document` (Mongo) or a `Mapped[...]` SQLAlchemy class (Postgres). Decide the ID strategy up front (auto-generated vs. natural key) — it determines whether you need Standards-style idempotency logic.
 3. **`dto.py`**: `Create{X}Request`, `Update{X}Request` (all optional), `{X}Response`, plus bulk variants if needed. `extra="forbid"` + explicit `Field` constraints on everything. Derived fields (`content_hash`, `qdrant_point_id`, timestamps) and immutable identity fields stay off the request models they don't belong on.
-4. **`repository.py`**: subclass `SQLRepository[Model]` or `MongoRepository[Model, IdType]`, set `model = ...`, add custom queries only if `find(spec)` / `count(spec)` genuinely can't express them.
+4. **`repository.py`**: subclass `SQLRepository[Model, IdType]` or `MongoRepository[Model, IdType]`, set `model = ...`, add custom queries only if `find(spec)` / `count(spec)` / `get_one(spec)` genuinely can't express them. SQL subclasses override `_options()` for `selectinload`.
 5. **`service.py`**: business logic only — DTO↔entity mapping, idempotency/business rules, `HTTPException` for domain errors (404/409/etc). List methods return `(items, total_count)` from `find` + `count`. Define a `SEARCHABLE_FIELDS` allowlist here if the module needs keyword search.
-6. **`controller.py`**: thin routes, `response_model=ApiResponse[...]` on every JSON success (list: `ApiResponse[list[{X}Response]]`). Wrap returns in `ApiResponse`; collection GET injects `Annotated[PaginationQuery, Depends()]` and sets `pagination=PaginationMeta.from_query(...)`. DELETE stays 204 with no body. Static paths (`/search`, `/bulk`) before `/{id}` paths.
+6. **`controller.py`**: thin routes, `response_model=ApiResponse[...]` on every JSON success (list: `ApiResponse[list[{X}Response]]`). Wrap returns in `ApiResponse`; collection GET injects `Annotated[PaginationQuery, Depends()]` and sets `pagination=PaginationMeta.from_query(...)`. DELETE stays 204 with no body. File download (assets `GET /{id}`) is `StreamingResponse`, not the envelope. Static paths (`/search`, `/bulk`) before `/{id}` paths.
 7. **`dependencies.py`**: `get_<x>_repository` → `get_<x>_service` → `<X>ServiceDep`.
-8. Register the router in `main.py`. If Mongo: add the `Document` class to `init_beanie(document_models=[...])` in `db/mongo/client.py`. If Postgres: generate an Alembic migration.
+8. Register the router in `main.py` (when the module has HTTP). If Mongo: add the `Document` class to `init_beanie(document_models=[...])` in `db/mongo/client.py`. If Postgres: import the models in `alembic/env.py` and generate an Alembic migration.
 9. Add tests mirroring `tests/modules/standards/` — in-memory fakes only (Section 15). Never point tests at a real database or directory.
 
 ---
@@ -1173,7 +1223,7 @@ class Settings(BaseSettings):
     MONGO_URI: str
     MONGO_DB_NAME: str = "app"
 
-    POSTGRES_DSN: str | None = None  # not used yet — make required once the first SQL module lands
+    POSTGRES_DSN: str | None = None  # lazy-checked on first session / Alembic; tests boot without it
 
     LOCAL_STORAGE_PATH: str = "./uploads"
 
@@ -1205,21 +1255,26 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from app.core.config import settings
 from app.db.mongo.client import init_mongo, close_mongo
+from app.db.postgres.session import dispose_postgres
 from app.modules.standards.controller import router as standards_router
+from app.modules.assets.controller import router as assets_router
+from app.modules.fixtures.controller import router as fixtures_router
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await init_mongo()
     yield
     await close_mongo()
-    # once the first Postgres module exists: import the engine and `await engine.dispose()` here too
+    await dispose_postgres()
 
 app = FastAPI(title=settings.APP_NAME, lifespan=lifespan)
 
 app.include_router(standards_router, prefix="/api/v1")
+app.include_router(assets_router, prefix="/api/v1")
+app.include_router(fixtures_router, prefix="/api/v1")
 ```
 
-Postgres tables (when the first SQL module arrives) are managed via **Alembic** migrations against `app.db.postgres.base.Base.metadata`. Mongo needs none — Beanie just needs every `Document` subclass listed in `init_beanie(document_models=[...])`.
+Postgres tables are managed via **Alembic** (`alembic/` + `alembic.ini`) against `app.db.postgres.base.Base.metadata`. `env.py` must import every SQL module's `models` so autogenerate sees them. Mongo needs none — Beanie just needs every `Document` subclass listed in `init_beanie(document_models=[...])`.
 
 ---
 
@@ -1239,7 +1294,7 @@ The examples in Section 9 raise `HTTPException` directly, which FastAPI already 
 
 ## 14. Local Dev Infra
 
-No Docker in this repo. Run Mongo (and later Postgres) however you already do.
+No Docker in this repo. Run Mongo and Postgres however you already do.
 
 Copy `.env.example` to `.env` and fill the names yourself. Names only — no sample hosts or passwords in `.env.example`:
 
@@ -1252,7 +1307,7 @@ APP_NAME=
 ENV=
 ```
 
-`MONGO_URI` is required to boot. `POSTGRES_DSN` stays unused until the first SQL module.
+`MONGO_URI` is required to boot. `POSTGRES_DSN` (`postgresql+asyncpg://...`) is required for Alembic and any assets/fixtures session; Settings keeps it optional so tests that import the app still boot. Fill it in `.env` yourself — do not put a sample value in `.env.example`.
 
 ---
 
@@ -1268,7 +1323,7 @@ ENV=
   - PATCH of content recomputes the hash and leaves `qdrant_point_id` and identity fields untouched.
   - `reject_duplicate_keys` with a repeated `id` or a repeated computed `qdrant_point_id` in one payload → `400`.
   - `create_many_standards` (the worker) inserts only genuinely new items into the fake; same-id retries and taken point ids are skipped.
-- **Controller tests**: `httpx.AsyncClient` against an app that **does not** run the production lifespan, with `app.dependency_overrides[get_standard_service] = lambda: FakeStandardService()`. Assert status codes and response bodies (flow + errors). JSON 2xx bodies are `{success, data, pagination}`; collection GET fills `pagination`, other JSON routes have `pagination: null`. `HTTPException` 404/409 stay `{detail: ...}` (not the envelope). Pydantic 422s (unknown fields, `qdrant_point_id` on create, identity fields / `qdrant_point_id` / `content_hash` on PATCH, `page=0`) live here. `POST /bulk` returns **202** with `data.item_count` without waiting on inserts. DELETE is **204** with no body.
+- **Controller tests**: `httpx.AsyncClient` against an app that **does not** run the production lifespan, with `app.dependency_overrides[get_<x>_service] = lambda: FakeService()`. Assert status codes and response bodies (flow + errors). JSON 2xx bodies are `{success, data, pagination}`; collection GET fills `pagination`, other JSON routes have `pagination: null`. `HTTPException` 404/409 stay `{detail: ...}` (not the envelope). Pydantic 422s (unknown fields, `qdrant_point_id` on create, identity fields / `qdrant_point_id` / `content_hash` on PATCH, `page=0`) live here. `POST /bulk` returns **202** with `data.item_count` without waiting on inserts. DELETE is **204** with no body. Assets: multipart POST 201; `GET /{id}` is raw file bytes (not the envelope); `?name=` is case-insensitive on `original_filename`. Fixtures: list has no `variants`; GET fixture by id includes the graph; GET variant includes `fixture` (summary, no variants); 409 on duplicate variant name; missing asset 404. Fakes never mkdir `./uploads`.
 - **Helper tests**: `generate_qdrant_point_id` is stable for the same identity, differs for `6.1|6.1.3.1` vs `6.13|6.13.1`, and ignores `activity`. `PaginationQuery.skip` and `PaginationMeta.from_query` (including `total_pages=0` when `total_count=0`).
 - **No repository/integration tests against a live engine.** Unique indexes and query plans are not the unit-test suite's job. Local Mongo is for running the app, not for pytest.
 
@@ -1291,7 +1346,7 @@ Once implemented, protected routes add `user: Annotated[User, Depends(get_curren
 ## 17. Getting Started Checklist
 
 1. `pip install` the packages from Section 2.
-2. Copy `.env.example` to `.env` and fill `MONGO_URI` (and the other names you need). Point it at Mongo you already run.
+2. Copy `.env.example` to `.env` and fill `MONGO_URI`. Fill `POSTGRES_DSN` (`postgresql+asyncpg://...`) before `alembic upgrade head`.
 3. Scaffold `core/`, `db/`, `storage/`, `shared/` as in Section 3.
 4. Build `modules/standards/` from Section 9's code.
 5. Wire `main.py` + `db/mongo/client.py` (Section 12), confirm Swagger UI at `/docs` shows accurate, strict schemas for every Standards route.
@@ -1303,8 +1358,7 @@ Once implemented, protected routes add `user: Annotated[User, Depends(get_curren
 
 ## 18. Roadmap
 
-- First Postgres-backed module, using Section 5b's `SQLRepository` the same way Standards uses `MongoRepository`.
 - Auth (JWT or session-based) + `get_current_user` + per-route scopes.
 - Mongo text index + `$text` search for `Standard.searchable_text` if `$regex` scanning becomes a bottleneck.
-- First file-upload module using `AbstractFileStorage`, swappable to `S3FileStorage` later.
+- `S3FileStorage` behind the same `AbstractFileStorage` interface.
 - Structured logging + request ID middleware.

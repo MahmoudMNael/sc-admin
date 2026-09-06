@@ -1,4 +1,4 @@
-from app.shared.specification.fields import FieldEquals
+from app.shared.specification.fields import ArrayContains, FieldEquals
 from app.shared.specification.keyword import KeywordSpecification
 from app.shared.specification.match_all import MatchAllSpecification
 
@@ -32,3 +32,18 @@ def test_match_all_and_field_equals_mongo():
 def test_empty_keywords_match_all():
     spec = KeywordSpecification(fields=["activity"], keywords=["  ", ""])
     assert spec.to_mongo(object) == {}
+
+
+class _Col:
+    def contains(self, value):
+        return ("contains", value)
+
+
+class _Model:
+    applications = _Col()
+
+
+def test_array_contains_sql_and_mongo():
+    spec = ArrayContains("applications", "interior")
+    assert spec.to_mongo(object) == {"applications": "interior"}
+    assert spec.to_sql(_Model) == ("contains", ["interior"])

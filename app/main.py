@@ -6,6 +6,9 @@ from app.core.config import settings
 from app.core.exceptions import register_exception_handlers
 from app.core.logging import setup_logging
 from app.db.mongo.client import close_mongo, init_mongo
+from app.db.postgres.session import dispose_postgres
+from app.modules.assets.controller import router as assets_router
+from app.modules.fixtures.controller import router as fixtures_router
 from app.modules.standards.controller import router as standards_router
 
 
@@ -14,7 +17,7 @@ async def lifespan(app: FastAPI):
     await init_mongo()
     yield
     await close_mongo()
-    # once the first Postgres module exists: import the engine and `await engine.dispose()` here too
+    await dispose_postgres()
 
 
 setup_logging("DEBUG" if settings.ENV == "local" else "INFO")
@@ -22,3 +25,5 @@ setup_logging("DEBUG" if settings.ENV == "local" else "INFO")
 app = FastAPI(title=settings.APP_NAME, lifespan=lifespan)
 register_exception_handlers(app)
 app.include_router(standards_router, prefix="/api/v1")
+app.include_router(assets_router, prefix="/api/v1")
+app.include_router(fixtures_router, prefix="/api/v1")
