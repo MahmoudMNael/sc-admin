@@ -16,3 +16,17 @@ class FieldEquals(Specification):
 
     def to_mongo(self, model):
         return {self.field: self.value}
+
+
+class ArrayContains(Specification):
+    """True when array column `field` contains `value` (Postgres `@>`, Mongo element match)."""
+
+    def __init__(self, field: str, value: Any):
+        self.field = field
+        self.value = value
+
+    def to_sql(self, model):
+        return getattr(model, self.field).contains([self.value])
+
+    def to_mongo(self, model):
+        return {self.field: self.value}

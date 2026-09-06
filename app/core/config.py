@@ -10,7 +10,7 @@ class Settings(BaseSettings):
     MONGO_URI: str
     MONGO_DB_NAME: str = "app"
 
-    POSTGRES_DSN: str | None = None  # not used yet — make required once the first SQL module lands
+    POSTGRES_DSN: str | None = None  # required for assets/fixtures and Alembic; lazy-checked on first session
 
     LOCAL_STORAGE_PATH: str = "./uploads"
 
