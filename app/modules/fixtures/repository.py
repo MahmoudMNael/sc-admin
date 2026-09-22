@@ -10,14 +10,16 @@ from .models import Fixture, FixtureVariant, FixtureVariantImage
 VARIANT_LOAD_OPTIONS = (
     selectinload(FixtureVariant.model_3d_file),
     selectinload(FixtureVariant.images).selectinload(FixtureVariantImage.image_file),
+    selectinload(FixtureVariant.ies_file),
+    selectinload(FixtureVariant.fixture)
 )
 
 
 class FixtureRepository(SQLRepository[Fixture, UUID]):
     model = Fixture
 
-    def _options(self):
-        return (selectinload(Fixture.ies_file),)
+    # def _options(self):
+    #     return (selectinload(Fixture.ies_file))
 
     async def get_with_variants(self, id: UUID) -> Fixture | None:
         stmt = (
@@ -43,7 +45,7 @@ class FixtureVariantRepository(SQLRepository[FixtureVariant, UUID]):
             select(FixtureVariant)
             .options(
                 *self._options(),
-                selectinload(FixtureVariant.fixture).selectinload(Fixture.ies_file),
+                selectinload(FixtureVariant.fixture),
             )
             .where(FixtureVariant.id == id)
         )

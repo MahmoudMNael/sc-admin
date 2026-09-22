@@ -38,7 +38,12 @@ class SQLRepository(AbstractRepository[ModelT, IdT], Generic[ModelT, IdT]):
         return await self.get_many_by_ids(ids)
 
     async def get_by_id(self, id: IdT) -> ModelT | None:
-        return await self.session.get(self.model, id, options=self._options())
+        return await self.session.get(
+            self.model,
+            id,
+            options=self._options(),
+            populate_existing=True,
+        )
 
     async def get_many_by_ids(self, ids: Sequence[IdT]) -> Sequence[ModelT]:
         if not ids:

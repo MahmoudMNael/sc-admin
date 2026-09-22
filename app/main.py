@@ -1,6 +1,7 @@
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 
 from app.core.config import settings
 from app.core.exceptions import register_exception_handlers
@@ -23,6 +24,19 @@ async def lifespan(app: FastAPI):
 setup_logging("DEBUG" if settings.ENV == "local" else "INFO")
 
 app = FastAPI(title=settings.APP_NAME, lifespan=lifespan)
+
+origins = [
+    "http://localhost:4200"
+]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,           # Allows requests from specific domains
+    allow_credentials=True,          # Allows cookies and authorization headers
+    allow_methods=["*"],             # Allows all standard HTTP methods (GET, POST, etc.)
+    allow_headers=["*"],             # Allows all headers
+)
+
 register_exception_handlers(app)
 app.include_router(standards_router, prefix="/api/v1")
 app.include_router(assets_router, prefix="/api/v1")
