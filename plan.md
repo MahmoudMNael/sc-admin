@@ -620,6 +620,8 @@ Postgres-backed repositories additionally depend on `Depends(get_postgres_sessio
 
 The first real module. Mongo-backed, natural-key ID, idempotent create.
 
+`GET /standards/categories` is a static path (before `/{standard_id}`) returning distinct `(standard_metadata, category_table_number, category_title)` — one row per `(standard_code, version_year, category_table_number)`. Optional `standard_code` / `version_year` / `is_latest` match list. No pagination (`pagination` is `null`); the set is small.
+
 Create request matches the upstream document: `_id`, `standard_metadata`, `hierarchy`, `activity`, `parameters`, `specific_requirements`, `searchable_text`. Missing entity fields (`qdrant_point_id`, `content_hash`, `created_at`, `updated_at`) are computed in the service before persist.
 
 `qdrant_point_id` is a **UUID v5** of the entry's immutable identity (`standard_code|version_year|category_table_number|ref_number`) via `generate_qdrant_point_id` in `shared/utils/qdrant.py`. It is never accepted from the request. Concatenating numbers is unsafe (`6.1.3.1`+`2019` and `6.13.1`+`2019` collide); the canonical string + UUID v5 does not. `activity`, `parameters`, and `searchable_text` are attributes, not identity — changing them must not change the Qdrant id.
@@ -800,6 +802,13 @@ class StandardResponse(BaseModel):
     updated_at: datetime
 
 
+class StandardCategoryResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid", from_attributes=True)
+    standard_metadata: StandardMetadataDTO
+    category_table_number: str = Field(..., min_length=1)
+    category_title: str = Field(..., min_length=1)
+
+
 class CreateManyStandardsRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     items: list[CreateStandardRequest] = Field(..., min_length=1)
@@ -815,7 +824,8 @@ class CreateManyStandardsAcceptedResponse(BaseModel):
 # modules/standards/repository.py
 from typing import Optional, Sequence
 from app.shared.repository.mongo_repository import MongoRepository
-from .models import Standard
+from app.shared.specification.base import Specification
+from .models import Standard, StandardMetadata
 
 class StandardRepository(MongoRepository[Standard, str]):
     model = Standard
@@ -827,6 +837,37 @@ class StandardRepository(MongoRepository[Standard, str]):
         if not point_ids:
             return []
         return await self.model.find({"qdrant_point_id": {"$in": list(point_ids)}}).to_list()
+
+    async def distinct_categories(self, spec: Specification) -> Sequence[tuple[StandardMetadata, str, str]]:
+        # ponytail: unbounded $group; lighting standards have tens of tables. Paginate if this becomes a huge cross-standard dump.
+        pipeline: list[dict] = []
+        match = spec.to_mongo(self.model)
+        if match:
+            pipeline.append({"$match": match})
+        pipeline.append({
+            "$group": {
+                "_id": {
+                    "standard_code": "$standard_metadata.standard_code",
+                    "version_year": "$standard_metadata.version_year",
+                    "category_table_number": "$hierarchy.category_table_number",
+                },
+                "category_title": {"$first": "$hierarchy.category_title"},
+                "is_latest": {"$first": "$standard_metadata.is_latest"},
+            }
+        })
+        rows = await self.model.aggregate(pipeline).to_list()
+        return [
+            (
+                StandardMetadata(
+                    standard_code=row["_id"]["standard_code"],
+                    version_year=row["_id"]["version_year"],
+                    is_latest=row["is_latest"],
+                ),
+                row["_id"]["category_table_number"],
+                row["category_title"],
+            )
+            for row in rows
+        ]
 ```
 
 ```python
@@ -845,7 +886,8 @@ from app.shared.specification.match_all import MatchAllSpecification
 from app.shared.utils import generate_qdrant_point_id
 
 from .dto import (
-    CreateManyStandardsRequest, CreateStandardRequest, StandardResponse, UpdateStandardRequest,
+    CreateManyStandardsRequest, CreateStandardRequest, StandardCategoryResponse,
+    StandardMetadataDTO, StandardResponse, UpdateStandardRequest,
 )
 from .models import Standard
 from .repository import StandardRepository
@@ -981,6 +1023,30 @@ class StandardService:
         standards = await self.repository.find(spec, skip=skip, limit=limit)
         return [StandardResponse.model_validate(s) for s in standards], total
 
+    async def list_categories(
+        self,
+        standard_code: str | None,
+        version_year: str | None,
+        is_latest: bool | None,
+    ) -> list[StandardCategoryResponse]:
+        spec = self._list_spec(standard_code, version_year, is_latest, None, None, [], "any")
+        rows = await self.repository.distinct_categories(spec)
+        items = [
+            StandardCategoryResponse(
+                standard_metadata=StandardMetadataDTO.model_validate(meta),
+                category_table_number=table_number,
+                category_title=title,
+            )
+            for meta, table_number, title in rows
+        ]
+
+        def _key(item: StandardCategoryResponse) -> tuple:
+            parts = tuple(int(p) if p.isdigit() else p for p in item.category_table_number.split("."))
+            return (item.standard_metadata.standard_code, item.standard_metadata.version_year, parts)
+
+        items.sort(key=_key)
+        return items
+
     def _list_spec(
         self,
         standard_code: str | None,
@@ -1049,7 +1115,7 @@ from app.shared.dto.response import ApiResponse
 from .dependencies import StandardServiceDep
 from .dto import (
     CreateManyStandardsAcceptedResponse, CreateManyStandardsRequest,
-    CreateStandardRequest, StandardResponse, UpdateStandardRequest,
+    CreateStandardRequest, StandardCategoryResponse, StandardResponse, UpdateStandardRequest,
 )
 
 router = APIRouter(prefix="/standards", tags=["Standards"])
@@ -1097,7 +1163,17 @@ async def list_standards(
     )
 
 
-# NOTE: static paths ("/bulk" above) must be declared before "/{standard_id}" —
+@router.get("/categories", response_model=ApiResponse[list[StandardCategoryResponse]])
+async def list_categories(
+    service: StandardServiceDep,
+    standard_code: str | None = Query(default=None),
+    version_year: str | None = Query(default=None),
+    is_latest: bool | None = Query(default=None),
+):
+    return ApiResponse(data=await service.list_categories(standard_code, version_year, is_latest))
+
+
+# NOTE: static paths ("/bulk", "/categories") must be declared before "/{standard_id}" —
 # otherwise FastAPI matches them as the path parameter instead.
 @router.get("/{standard_id}", response_model=ApiResponse[StandardResponse], responses={**RESP_404})
 async def get_standard(standard_id: str, service: StandardServiceDep):
@@ -1199,9 +1275,9 @@ This pattern (natural key as the DB id + a computed content fingerprint + a UUID
 1. Create `modules/<name>/` with the six files: `models.py`, `dto.py`, `repository.py`, `service.py`, `controller.py`, `dependencies.py`.
 2. **`models.py`**: define the entity — a Beanie `Document` (Mongo) or a `Mapped[...]` SQLAlchemy class (Postgres). Decide the ID strategy up front (auto-generated vs. natural key) — it determines whether you need Standards-style idempotency logic.
 3. **`dto.py`**: `Create{X}Request`, `Update{X}Request` (all optional), `{X}Response`, plus bulk variants if needed. `extra="forbid"` + explicit `Field` constraints on everything. Derived fields (`content_hash`, `qdrant_point_id`, timestamps) and immutable identity fields stay off the request models they don't belong on.
-4. **`repository.py`**: subclass `SQLRepository[Model, IdType]` or `MongoRepository[Model, IdType]`, set `model = ...`, add custom queries only if `find(spec)` / `count(spec)` / `get_one(spec)` genuinely can't express them. SQL subclasses override `_options()` for `selectinload`.
+4. **`repository.py`**: subclass `SQLRepository[Model, IdType]` or `MongoRepository[Model, IdType]`, set `model = ...`, add custom queries only if `find(spec)` / `count(spec)` / `get_one(spec)` genuinely can't express them (Standards `distinct_categories` is a `$group` — not a generic base-class method). SQL subclasses override `_options()` for `selectinload`.
 5. **`service.py`**: business logic only — DTO↔entity mapping, idempotency/business rules, `HTTPException` for domain errors (404/409/etc). List methods return `(items, total_count)` from `find` + `count`. Define a `SEARCHABLE_FIELDS` allowlist here if the module needs keyword search.
-6. **`controller.py`**: thin routes, `response_model=ApiResponse[...]` on every JSON success (list: `ApiResponse[list[{X}Response]]`). Wrap returns in `ApiResponse`; collection GET injects `Annotated[PaginationQuery, Depends()]` and sets `pagination=PaginationMeta.from_query(...)`. DELETE stays 204 with no body. File download (assets `GET /{id}`) is `StreamingResponse`, not the envelope. Static paths (`/search`, `/bulk`) before `/{id}` paths.
+6. **`controller.py`**: thin routes, `response_model=ApiResponse[...]` on every JSON success (list: `ApiResponse[list[{X}Response]]`). Wrap returns in `ApiResponse`; collection GET injects `Annotated[PaginationQuery, Depends()]` and sets `pagination=PaginationMeta.from_query(...)`. Bounded distinct lookups (`GET /standards/categories`) leave `pagination` null. DELETE stays 204 with no body. File download (assets `GET /{id}`) is `StreamingResponse`, not the envelope. Static paths (`/search`, `/bulk`, `/categories`) before `/{id}` paths.
 7. **`dependencies.py`**: `get_<x>_repository` → `get_<x>_service` → `<X>ServiceDep`.
 8. Register the router in `main.py` (when the module has HTTP). If Mongo: add the `Document` class to `init_beanie(document_models=[...])` in `db/mongo/client.py`. If Postgres: import the models in `alembic/env.py` and generate an Alembic migration.
 9. Add tests mirroring `tests/modules/standards/` — in-memory fakes only (Section 15). Never point tests at a real database or directory.
@@ -1323,7 +1399,8 @@ ENV=
   - PATCH of content recomputes the hash and leaves `qdrant_point_id` and identity fields untouched.
   - `reject_duplicate_keys` with a repeated `id` or a repeated computed `qdrant_point_id` in one payload → `400`.
   - `create_many_standards` (the worker) inserts only genuinely new items into the fake; same-id retries and taken point ids are skipped.
-- **Controller tests**: `httpx.AsyncClient` against an app that **does not** run the production lifespan, with `app.dependency_overrides[get_<x>_service] = lambda: FakeService()`. Assert status codes and response bodies (flow + errors). JSON 2xx bodies are `{success, data, pagination}`; collection GET fills `pagination`, other JSON routes have `pagination: null`. `HTTPException` 404/409 stay `{detail: ...}` (not the envelope). Pydantic 422s (unknown fields, `qdrant_point_id` on create, identity fields / `qdrant_point_id` / `content_hash` on PATCH, `page=0`) live here. `POST /bulk` returns **202** with `data.item_count` without waiting on inserts. DELETE is **204** with no body. Assets: multipart POST 201; `GET /{id}` is raw file bytes (not the envelope); `?name=` is case-insensitive on `original_filename`. Fixtures: list has no `variants`; GET fixture by id includes the graph; GET variant includes `fixture` (summary, no variants); 409 on duplicate variant name; missing asset 404. Fakes never mkdir `./uploads`.
+  - `list_categories`: two rows with the same metadata + table and different `ref_number` → one category; the same table number under a different `standard_code` → two categories, each carrying its `standard_metadata`.
+- **Controller tests**: `httpx.AsyncClient` against an app that **does not** run the production lifespan, with `app.dependency_overrides[get_<x>_service] = lambda: FakeService()`. Assert status codes and response bodies (flow + errors). JSON 2xx bodies are `{success, data, pagination}`; collection GET fills `pagination`, other JSON routes have `pagination: null`. `HTTPException` 404/409 stay `{detail: ...}` (not the envelope). Pydantic 422s (unknown fields, `qdrant_point_id` on create, identity fields / `qdrant_point_id` / `content_hash` on PATCH, `page=0`) live here. `POST /bulk` returns **202** with `data.item_count` without waiting on inserts. `GET /categories` is **200** with `{success, data, pagination: null}` and is not captured by `/{standard_id}`. DELETE is **204** with no body. Assets: multipart POST 201; `GET /{id}` is raw file bytes (not the envelope); `?name=` is case-insensitive on `original_filename`. Fixtures: list has no `variants`; GET fixture by id includes the graph; GET variant includes `fixture` (summary, no variants); 409 on duplicate variant name; missing asset 404. Fakes never mkdir `./uploads`.
 - **Helper tests**: `generate_qdrant_point_id` is stable for the same identity, differs for `6.1|6.1.3.1` vs `6.13|6.13.1`, and ignores `activity`. `PaginationQuery.skip` and `PaginationMeta.from_query` (including `total_pages=0` when `total_count=0`).
 - **No repository/integration tests against a live engine.** Unique indexes and query plans are not the unit-test suite's job. Local Mongo is for running the app, not for pytest.
 

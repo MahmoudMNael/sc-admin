@@ -47,7 +47,7 @@ class StandardParametersDTO(BaseModel):
 
 
 class CreateStandardRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True, populate_by_name=True)
+    model_config = ConfigDict(extra="ignore", str_strip_whitespace=True, populate_by_name=True)
 
     id: str = Field(
         ...,
@@ -91,6 +91,14 @@ class StandardResponse(BaseModel):
     content_hash: str
     created_at: datetime
     updated_at: datetime
+
+
+class StandardCategoryResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid", from_attributes=True)
+
+    standard_metadata: StandardMetadataDTO
+    category_table_number: str = Field(..., min_length=1)
+    category_title: str = Field(..., min_length=1)
 
 
 class CreateManyStandardsRequest(BaseModel):

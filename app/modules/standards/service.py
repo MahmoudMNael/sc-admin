@@ -15,6 +15,8 @@ from app.shared.utils import generate_qdrant_point_id
 from .dto import (
     CreateManyStandardsRequest,
     CreateStandardRequest,
+    StandardCategoryResponse,
+    StandardMetadataDTO,
     StandardResponse,
     UpdateStandardRequest,
 )
@@ -160,6 +162,30 @@ class StandardService:
         total = await self.repository.count(spec)
         standards = await self.repository.find(spec, skip=skip, limit=limit)
         return [StandardResponse.model_validate(s) for s in standards], total
+
+    async def list_categories(
+        self,
+        standard_code: str | None,
+        version_year: str | None,
+        is_latest: bool | None,
+    ) -> list[StandardCategoryResponse]:
+        spec = self._list_spec(standard_code, version_year, is_latest, None, None, [], "any")
+        rows = await self.repository.distinct_categories(spec)
+        items = [
+            StandardCategoryResponse(
+                standard_metadata=StandardMetadataDTO.model_validate(meta),
+                category_table_number=table_number,
+                category_title=title,
+            )
+            for meta, table_number, title in rows
+        ]
+
+        def _key(item: StandardCategoryResponse) -> tuple:
+            parts = tuple(int(p) if p.isdigit() else p for p in item.category_table_number.split("."))
+            return (item.standard_metadata.standard_code, item.standard_metadata.version_year, parts)
+
+        items.sort(key=_key)
+        return items
 
     def _list_spec(
         self,
