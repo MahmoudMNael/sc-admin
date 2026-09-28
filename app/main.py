@@ -26,7 +26,8 @@ setup_logging("DEBUG" if settings.ENV == "local" else "INFO")
 app = FastAPI(title=settings.APP_NAME, lifespan=lifespan)
 
 origins = [
-    "http://localhost:4200"
+    "http://localhost:4200",
+    "http://127.0.0.1:5500",
 ]
 
 app.add_middleware(
