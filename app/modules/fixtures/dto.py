@@ -19,7 +19,6 @@ class CreateFixtureRequest(BaseModel):
 
     manufacturer_name: str = Field(..., min_length=1)
     name: str = Field(..., min_length=1)
-    ies_file_id: UUID
     is_main_solution: bool = False
     applications: list[FixtureApplication] = Field(..., min_length=1, max_length=2)
 
@@ -34,7 +33,6 @@ class UpdateFixtureRequest(BaseModel):
 
     manufacturer_name: str | None = Field(None, min_length=1)
     name: str | None = Field(None, min_length=1)
-    ies_file_id: UUID | None = None
     is_main_solution: bool | None = None
     applications: list[FixtureApplication] | None = Field(None, min_length=1, max_length=2)
 
@@ -61,6 +59,7 @@ class CreateVariantRequest(BaseModel):
     dimension_depth: Decimal | None = Field(None, ge=0)
     dimension_radius: Decimal | None = Field(None, ge=0)
     model_3d_file_id: UUID | None = None
+    ies_file_id: UUID
 
     @field_validator("mechanical_protections")
     @classmethod
@@ -90,6 +89,7 @@ class UpdateVariantRequest(BaseModel):
     dimension_depth: Decimal | None = Field(None, ge=0)
     dimension_radius: Decimal | None = Field(None, ge=0)
     model_3d_file_id: UUID | None = None
+    ies_file_id: UUID
 
     @field_validator("mechanical_protections")
     @classmethod
@@ -137,6 +137,8 @@ class VariantResponse(BaseModel):
     dimension_radius: Decimal | None
     model_3d_file_id: UUID | None
     model_3d_file: AssetResponse | None
+    ies_file_id: UUID
+    ies_file: AssetResponse
     images: list[VariantImageResponse]
     created_at: datetime
     updated_at: datetime
@@ -148,8 +150,6 @@ class FixtureSummaryResponse(BaseModel):
     id: UUID
     manufacturer_name: str
     name: str
-    ies_file_id: UUID
-    ies_file: AssetResponse
     is_main_solution: bool
     applications: list[str]
     created_at: datetime

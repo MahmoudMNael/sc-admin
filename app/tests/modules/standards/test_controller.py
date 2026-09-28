@@ -148,6 +148,22 @@ async def test_list_rejects_page_zero(client: AsyncClient):
     assert response.status_code == 422
 
 
+async def test_list_categories_wraps_without_pagination(client: AsyncClient):
+    await client.post("/api/v1/standards/", json=sample_json())
+    response = await client.get("/api/v1/standards/categories")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["success"] is True
+    assert body["pagination"] is None
+    assert len(body["data"]) == 1
+    row = body["data"][0]
+    assert row["category_table_number"] == "6.1"
+    assert row["category_title"] == "Indoor workplaces"
+    assert row["standard_metadata"]["standard_code"] == "EN 12464-1"
+    assert row["standard_metadata"]["version_year"] == "2019"
+    assert row["standard_metadata"]["is_latest"] is True
+
+
 async def test_get_one_wraps_without_pagination(client: AsyncClient):
     await client.post("/api/v1/standards/", json=sample_json())
     response = await client.get("/api/v1/standards/en12464_1_v2019_6_1_1")

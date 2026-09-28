@@ -63,3 +63,20 @@ class FakeStandardRepository(AbstractRepository[Standard, str]):
     async def get_many_by_qdrant_point_ids(self, point_ids: Sequence[str]) -> Sequence[Standard]:
         wanted = set(point_ids)
         return [entity for entity in self.store.values() if entity.qdrant_point_id in wanted]
+
+    async def distinct_categories(self, spec: Specification) -> Sequence[tuple]:
+        # ponytail: fake ignores spec the same way find does; swap both for in-memory spec eval if category tests need filter totals.
+        seen: dict[tuple[str, str, str], tuple] = {}
+        for entity in self.store.values():
+            key = (
+                entity.standard_metadata.standard_code,
+                entity.standard_metadata.version_year,
+                entity.hierarchy.category_table_number,
+            )
+            if key not in seen:
+                seen[key] = (
+                    entity.standard_metadata,
+                    entity.hierarchy.category_table_number,
+                    entity.hierarchy.category_title,
+                )
+        return list(seen.values())

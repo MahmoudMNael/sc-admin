@@ -62,7 +62,6 @@ class Fixture(Base):
     id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
     manufacturer_name: Mapped[str] = mapped_column(String, nullable=False)
     name: Mapped[str] = mapped_column(String, nullable=False)
-    ies_file_id: Mapped[UUID] = mapped_column(ForeignKey("assets.id", ondelete="RESTRICT"), index=True)
     is_main_solution: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default=text("false"), index=True
     )
@@ -81,7 +80,6 @@ class Fixture(Base):
         nullable=False,
     )
 
-    ies_file: Mapped[Asset] = relationship(lazy="raise")
     variants: Mapped[list["FixtureVariant"]] = relationship(
         back_populates="fixture",
         lazy="raise",
@@ -122,6 +120,7 @@ class FixtureVariant(Base):
     model_3d_file_id: Mapped[UUID | None] = mapped_column(
         ForeignKey("assets.id", ondelete="RESTRICT"), index=True, nullable=True
     )
+    ies_file_id: Mapped[UUID] = mapped_column(ForeignKey("assets.id", ondelete="RESTRICT"), index=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         default=lambda: datetime.now(timezone.utc),
@@ -137,7 +136,8 @@ class FixtureVariant(Base):
     )
 
     fixture: Mapped[Fixture] = relationship(back_populates="variants", lazy="raise")
-    model_3d_file: Mapped[Asset | None] = relationship(lazy="raise")
+    model_3d_file: Mapped[Asset | None] = relationship(lazy="raise", foreign_keys=[model_3d_file_id])
+    ies_file: Mapped[Asset] = relationship(lazy="raise", foreign_keys=[ies_file_id])
     images: Mapped[list["FixtureVariantImage"]] = relationship(
         back_populates="variant",
         lazy="raise",

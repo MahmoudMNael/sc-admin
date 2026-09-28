@@ -31,6 +31,37 @@ from .repository import (
 )
 
 SEARCHABLE_FIELDS = ["manufacturer_name", "name"]
+VARIANT_SEARCHABLE_FIELDS = ["name"]
+
+
+class _VariantFixtureApplicationSpec(Specification):
+    """Filter variants by parent fixture application via relationship (no repo change)."""
+
+    def __init__(self, application: str):
+        self.application = application
+
+    def to_sql(self, model):
+        from app.modules.fixtures.models import Fixture
+
+        return model.fixture.has(Fixture.applications.contains([self.application]))
+
+    def to_mongo(self, model):
+        return {"fixture.applications": self.application}
+
+
+class _VariantFixtureIsMainSolutionSpec(Specification):
+    """Filter variants by parent fixture is_main_solution flag via relationship."""
+
+    def __init__(self, is_main_solution: bool):
+        self.is_main_solution = is_main_solution
+
+    def to_sql(self, model):
+        from app.modules.fixtures.models import Fixture
+
+        return model.fixture.has(Fixture.is_main_solution == self.is_main_solution)
+
+    def to_mongo(self, model):
+        return {"fixture.is_main_solution": self.is_main_solution}
 
 
 class FixtureService:
@@ -47,11 +78,9 @@ class FixtureService:
         self.assets = assets
 
     async def create_fixture(self, payload: CreateFixtureRequest) -> FixtureSummaryResponse:
-        ies = await self._require_asset(payload.ies_file_id)
         entity = Fixture(
             manufacturer_name=payload.manufacturer_name,
             name=payload.name,
-            ies_file_id=ies.id,
             is_main_solution=payload.is_main_solution,
             applications=[a.value for a in payload.applications],
         )
@@ -59,7 +88,7 @@ class FixtureService:
             created = await self.fixtures.create(entity)
         except IntegrityError:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, "Invalid asset reference") from None
-        created.ies_file = ies
+
         return FixtureSummaryResponse.model_validate(created)
 
     async def list_fixtures(
@@ -81,6 +110,32 @@ class FixtureService:
         items = await self.fixtures.find(spec, skip=skip, limit=limit)
         return [FixtureSummaryResponse.model_validate(item) for item in items], total
 
+    async def list_variants(
+        self,
+        q: str | None,
+        application: str | None,
+        is_main_solution: bool | None,
+        fixture_id: UUID | None,
+        skip: int,
+        limit: int,
+    ) -> tuple[list[VariantDetailResponse], int]:
+        if fixture_id is not None:
+            await self._require_fixture(fixture_id)
+        spec: Specification = MatchAllSpecification()
+        if q and q.strip():
+            spec = spec & KeywordSpecification(
+                fields=VARIANT_SEARCHABLE_FIELDS, keywords=[q], match_mode="all"
+            )
+        if fixture_id is not None:
+            spec = spec & FieldEquals("fixture_id", fixture_id)
+        if application:
+            spec = spec & _VariantFixtureApplicationSpec(application)
+        if is_main_solution is not None:
+            spec = spec & _VariantFixtureIsMainSolutionSpec(is_main_solution)
+        total = await self.variants.count(spec)
+        items = await self.variants.find(spec, skip=skip, limit=limit)
+        return [VariantDetailResponse.model_validate(item) for item in items], total
+
     async def get_fixture(self, fixture_id: UUID) -> FixtureResponse:
         fixture = await self.fixtures.get_with_variants(fixture_id)
         if fixture is None:
@@ -94,8 +149,6 @@ class FixtureService:
         data = payload.model_dump(exclude_unset=True)
         if not data:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, "No fields provided to update")
-        if "ies_file_id" in data:
-            await self._require_asset(data["ies_file_id"])
         if "applications" in data:
             data["applications"] = [a.value if hasattr(a, "value") else a for a in payload.applications or []]
         data["updated_at"] = datetime.now(timezone.utc)
@@ -111,6 +164,9 @@ class FixtureService:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "Fixture not found")
 
     async def create_variant(self, fixture_id: UUID, payload: CreateVariantRequest) -> VariantResponse:
+        ies = await self._require_asset(payload.ies_file_id)
+        if ies is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "IES file not found")
         await self._require_fixture(fixture_id)
         if payload.model_3d_file_id is not None:
             await self._require_asset(payload.model_3d_file_id)
@@ -131,6 +187,7 @@ class FixtureService:
             dimension_depth=payload.dimension_depth,
             dimension_radius=payload.dimension_radius,
             model_3d_file_id=payload.model_3d_file_id,
+            ies_file_id=payload.ies_file_id,
         )
         try:
             created = await self.variants.create(entity)
@@ -139,6 +196,7 @@ class FixtureService:
         loaded = await self.variants.get_by_id(created.id)
         assert loaded is not None
         return VariantResponse.model_validate(loaded)
+
 
     async def get_variant(self, fixture_id: UUID, variant_id: UUID) -> VariantDetailResponse:
         await self._require_fixture(fixture_id)
@@ -158,6 +216,8 @@ class FixtureService:
             await self._reject_duplicate_variant_name(fixture_id, data["name"], exclude_id=variant_id)
         if "model_3d_file_id" in data and data["model_3d_file_id"] is not None:
             await self._require_asset(data["model_3d_file_id"])
+        if "ies_file_id" in data and data["ies_file_id"] is not None:
+            await self._require_asset(data["ies_file_id"])
         if "electrical_protections" in data:
             data["electrical_protections"] = [
                 e.value if hasattr(e, "value") else e for e in payload.electrical_protections or []

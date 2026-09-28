@@ -60,6 +60,29 @@ async def list_fixtures(
     )
 
 
+@router.get("/variants/", response_model=ApiResponse[list[VariantDetailResponse]])
+async def list_all_variants(
+    service: FixtureServiceDep,
+    pagination: Annotated[PaginationQuery, Depends()],
+    q: Annotated[str | None, Query()] = None,
+    application: Annotated[FixtureApplication | None, Query()] = None,
+    is_main_solution: Annotated[bool | None, Query()] = None,
+    fixture_id: Annotated[UUID | None, Query()] = None,
+):
+    items, total = await service.list_variants(
+        q,
+        application.value if application else None,
+        is_main_solution,
+        fixture_id,
+        pagination.skip,
+        pagination.limit,
+    )
+    return ApiResponse(
+        data=items,
+        pagination=PaginationMeta.from_query(total, pagination.page, pagination.limit),
+    )
+
+
 @router.get(
     "/{fixture_id}",
     response_model=ApiResponse[FixtureResponse],
@@ -91,6 +114,33 @@ async def delete_fixture(fixture_id: UUID, service: FixtureServiceDep):
 )
 async def create_variant(fixture_id: UUID, payload: CreateVariantRequest, service: FixtureServiceDep):
     return ApiResponse(data=await service.create_variant(fixture_id, payload))
+
+
+@router.get(
+    "/{fixture_id}/variants/",
+    response_model=ApiResponse[list[VariantDetailResponse]],
+    responses={**RESP_404},
+)
+async def list_fixture_variants(
+    fixture_id: UUID,
+    service: FixtureServiceDep,
+    pagination: Annotated[PaginationQuery, Depends()],
+    q: Annotated[str | None, Query()] = None,
+    application: Annotated[FixtureApplication | None, Query()] = None,
+    is_main_solution: Annotated[bool | None, Query()] = None,
+):
+    items, total = await service.list_variants(
+        q,
+        application.value if application else None,
+        is_main_solution,
+        fixture_id,
+        pagination.skip,
+        pagination.limit,
+    )
+    return ApiResponse(
+        data=items,
+        pagination=PaginationMeta.from_query(total, pagination.page, pagination.limit),
+    )
 
 
 @router.get(

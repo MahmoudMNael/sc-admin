@@ -11,6 +11,7 @@ from .dto import (
     CreateManyStandardsAcceptedResponse,
     CreateManyStandardsRequest,
     CreateStandardRequest,
+    StandardCategoryResponse,
     StandardResponse,
     UpdateStandardRequest,
 )
@@ -78,7 +79,17 @@ async def list_standards(
     )
 
 
-# NOTE: static paths ("/bulk" above) must be declared before "/{standard_id}" —
+@router.get("/categories", response_model=ApiResponse[list[StandardCategoryResponse]])
+async def list_categories(
+    service: StandardServiceDep,
+    standard_code: str | None = Query(default=None),
+    version_year: str | None = Query(default=None),
+    is_latest: bool | None = Query(default=None),
+):
+    return ApiResponse(data=await service.list_categories(standard_code, version_year, is_latest))
+
+
+# NOTE: static paths ("/bulk", "/categories") must be declared before "/{standard_id}" —
 # otherwise FastAPI matches them as the path parameter instead.
 @router.get(
     "/{standard_id}",

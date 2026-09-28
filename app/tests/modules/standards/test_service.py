@@ -170,3 +170,29 @@ async def test_list_returns_items_and_total():
     assert total == 2
     assert len(items) == 1
     assert len(repo.store) == 2
+
+
+async def test_list_categories_distinct_by_metadata_and_table():
+    service, _repo = _service()
+    await service.create_standard(sample_payload())
+    await service.create_standard(
+        sample_payload(id="same_table", hierarchy=sample_hierarchy(ref_number="6.1.2"))
+    )
+    await service.create_standard(
+        sample_payload(
+            id="other_standard",
+            standard_metadata={
+                "standard_code": "EN 12464-2",
+                "version_year": "2019",
+                "is_latest": True,
+            },
+        )
+    )
+    items = await service.list_categories(None, None, None)
+    assert len(items) == 2
+    by_code = {item.standard_metadata.standard_code: item for item in items}
+    assert by_code["EN 12464-1"].category_table_number == "6.1"
+    assert by_code["EN 12464-1"].category_title == "Indoor workplaces"
+    assert by_code["EN 12464-1"].standard_metadata.version_year == "2019"
+    assert by_code["EN 12464-2"].category_table_number == "6.1"
+    assert by_code["EN 12464-2"].standard_metadata.standard_code == "EN 12464-2"
